@@ -91,6 +91,7 @@ class TrainArgumentsMixin:
             shared memory and then asynchronously persisted to disk. Currently does not support the safetensors format.
             It is recommended to use this with `PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"` to prevent CUDA OOM
             errors during training. Defaults to False.
+        callbacks (List[str]): Built-in trainer callbacks to enable. Defaults to `[]`.
     """
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
@@ -141,6 +142,7 @@ class TrainArgumentsMixin:
 
     # dlrover flash_checkpoint
     use_flash_ckpt: bool = False
+    callbacks: List[str] = field(default_factory=list)
 
     @staticmethod
     def _patch_liger_kernel():

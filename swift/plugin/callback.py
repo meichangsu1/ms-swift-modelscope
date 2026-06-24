@@ -1,13 +1,54 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import signal
 import time
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
-from swift.utils import get_logger
+from swift.utils import get_device, get_logger
 
 logger = get_logger()
+
+
+class DeepspeedElasticCallback(TrainerCallback):
+    """Compatibility marker for enabling DeepSpeed elastic setup during argument initialization."""
+
+
+class GracefulExitCallback(TrainerCallback):
+
+    def __init__(self):
+        self._pending_stop = False
+        self._shutdown_requested = False
+        try:
+            signal.signal(signal.SIGTERM, self._request_shutdown)
+            signal.signal(signal.SIGINT, self._request_shutdown)
+        except ValueError as e:
+            logger.warning(f'Failed to register graceful exit signal handlers: {e}')
+
+    def _request_shutdown(self, *args, **kwargs):
+        self._shutdown_requested = True
+
+    def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        local_req = 1 if self._shutdown_requested else 0
+        if dist.is_available() and dist.is_initialized():
+            t = torch.tensor([local_req], dtype=torch.uint8, device=get_device())
+            dist.all_reduce(t, op=dist.ReduceOp.MAX)
+            any_req = bool(int(t.item()))
+        else:
+            any_req = bool(local_req)
+
+        if any_req:
+            control.should_save = True
+            self._pending_stop = True
+        return control
+
+    def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        if self._pending_stop:
+            control.should_training_stop = True
+            self._pending_stop = False
+        return control
 
 
 class EarlyStopCallback(TrainerCallback):
@@ -160,5 +201,9 @@ device_flops_map = {
 }
 
 extra_callbacks = []
+callbacks_map = {
+    'deepspeed_elastic': DeepspeedElasticCallback,
+    'graceful_exit': GracefulExitCallback,
+}
 # This example shows a simple example of EarlyStop Callback, uncomment this to use
 # extra_callbacks = [EarlyStopCallback()]

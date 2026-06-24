@@ -8,6 +8,7 @@ from transformers.utils.versions import require_version
 
 from swift.trainers import TrainerFactory
 from swift.trainers.arguments import TrainArgumentsMixin
+from swift.trainers.utils import prepare_deepspeed_elastic_config
 from swift.utils import (add_version_to_work_dir, get_device_count, get_logger, get_pai_tensorboard_dir, is_master,
                          is_mp, is_pai_training_job, is_swanlab_available, json_parse_to_dict)
 from .base_args import BaseArguments, to_abspath
@@ -262,6 +263,8 @@ class TrainArguments(SwanlabArguments, TunerArguments, BaseArguments, Seq2SeqTra
                     'To use `deepspeed_autotp_size`, you need to additionally set the `--deepspeed` argument.')
                 self.deepspeed['tensor_parallel'] = {'autotp_size': self.deepspeed_autotp_size}
                 self.deepspeed['zero_optimization']['gather_16bit_weights_on_model_save'] = True
+            if 'deepspeed_elastic' in set(getattr(self, 'callbacks', []) or []):
+                prepare_deepspeed_elastic_config(self)
             logger.info(f'Using deepspeed: {self.deepspeed}')
 
     def _handle_pai_compat(self) -> None:

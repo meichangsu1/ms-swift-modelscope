@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 from swift.utils.import_utils import _LazyModule
 
 if TYPE_CHECKING:
-    from .callback import extra_callbacks
+    from .callback import callbacks_map, extra_callbacks
     from .loss import loss_mapping, get_loss_func
     from .loss_scale import loss_scale_map
     from .metric import InferStats, MeanMetric, Metric, compute_acc, get_metric, compute_rouge_bleu, metric_mapping
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 else:
     _import_structure = {
-        'callback': ['extra_callbacks'],
+        'callback': ['callbacks_map', 'extra_callbacks'],
         'loss': ['loss_mapping', 'get_loss_func'],
         'loss_scale': ['loss_scale_map'],
         'metric':

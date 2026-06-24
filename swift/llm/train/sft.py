@@ -5,7 +5,7 @@ from typing import List, Optional, Union
 
 from datasets import Dataset as HfDataset
 
-from swift.plugin import extra_callbacks
+from swift.plugin import callbacks_map, extra_callbacks
 from swift.ray import RayHelper
 from swift.trainers import TrainerFactory
 from swift.utils import append_to_jsonl, get_logger, get_model_parameter_info, is_master, plot_images, stat_array
@@ -251,11 +251,27 @@ class SwiftSft(SwiftPipeline, TunerMixin):
             append_to_jsonl(jsonl_path, self.train_msg, strict=False)
         return self.train_msg
 
+    def _get_resume_checkpoint(self, trainer):
+        args = trainer.args
+        if args.resume_from_checkpoint:
+            return args.resume_from_checkpoint
+        resume_checkpoint = None
+        if args.use_flash_ckpt:
+            resume_checkpoint = trainer.get_resume_checkpoint()
+
+        callbacks = set(getattr(args, 'callbacks', []) or [])
+        elastic_enabled = 'deepspeed_elastic' in callbacks
+        if elastic_enabled and (resume_checkpoint is None
+                                or not os.path.exists(os.path.join(resume_checkpoint, 'latest_universal'))):
+            resume_checkpoint = trainer.get_resume_checkpoint_until_find_ucp()
+        return resume_checkpoint
+
     def train(self, trainer):
         logging_path = os.path.join(trainer.args.output_dir, 'logging.jsonl')
         logger.info(f'The logging file will be saved in: {logging_path}')
+        resume_checkpoint = self._get_resume_checkpoint(trainer)
         try:
-            trainer.train(trainer.args.resume_from_checkpoint)
+            trainer.train(resume_checkpoint)
         finally:
             res = self._save_trainer_state(trainer)
             if self.args.use_flash_ckpt:
@@ -279,6 +295,11 @@ class SwiftSft(SwiftPipeline, TunerMixin):
 
         if args.is_adapter and args.train_type == 'adalora':
             callbacks.append(TrainerAdapterCallback(args))
+        for callback_name in args.callbacks:
+            if callback_name not in callbacks_map:
+                raise ValueError(f'Unsupported callback: {callback_name}. '
+                                 f'Supported callbacks: {list(callbacks_map.keys())}')
+            callbacks.append(callbacks_map[callback_name]())
         callbacks += extra_callbacks
         self.callbacks = callbacks
 
