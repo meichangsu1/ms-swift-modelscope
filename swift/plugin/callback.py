@@ -1,4 +1,5 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import os
 import signal
 import time
 
@@ -18,20 +19,29 @@ class DeepspeedElasticCallback(TrainerCallback):
 
 class GracefulExitCallback(TrainerCallback):
 
-    def __init__(self):
+    def __init__(self, stop_file='/tmp/stop'):
         self._pending_stop = False
         self._shutdown_requested = False
-        try:
-            signal.signal(signal.SIGTERM, self._request_shutdown)
-            signal.signal(signal.SIGINT, self._request_shutdown)
-        except ValueError as e:
-            logger.warning(f'Failed to register graceful exit signal handlers: {e}')
+        self._stop_file = stop_file
+        self._old_handlers = {}
+        self._register_signal_handlers()
+
+    def _register_signal_handlers(self):
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGUSR1, signal.SIGUSR2):
+            try:
+                self._old_handlers[sig] = signal.getsignal(sig)
+                signal.signal(sig, self._request_shutdown)
+            except ValueError as e:
+                logger.warning(f'Failed to register graceful exit signal handler for {sig}: {e}')
 
     def _request_shutdown(self, *args, **kwargs):
         self._shutdown_requested = True
 
+    def _should_shutdown(self):
+        return self._shutdown_requested or os.path.exists(self._stop_file)
+
     def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        local_req = 1 if self._shutdown_requested else 0
+        local_req = 1 if self._should_shutdown() else 0
         if dist.is_available() and dist.is_initialized():
             t = torch.tensor([local_req], dtype=torch.uint8, device=get_device())
             dist.all_reduce(t, op=dist.ReduceOp.MAX)
@@ -48,6 +58,12 @@ class GracefulExitCallback(TrainerCallback):
         if self._pending_stop:
             control.should_training_stop = True
             self._pending_stop = False
+        return control
+
+    def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        for sig, handler in self._old_handlers.items():
+            signal.signal(sig, handler)
+        self._old_handlers = {}
         return control
 
 
