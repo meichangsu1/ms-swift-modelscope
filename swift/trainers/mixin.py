@@ -561,13 +561,13 @@ class SwiftMixin:
         checkpoint_folder = f'{PREFIX_CHECKPOINT_DIR}-{step}'
         return os.path.join(resume_dir, checkpoint_folder)
 
-    def wait_latest_checkpoint(self, timeout=FLASH_CKPT_WAIT_TIMEOUT):
+    def wait_latest_checkpoint(self, timeout=None, max_steps=None):
         """
         Wait for the latest checkpoint.
         Args:
             timeout (second): The timeout to wait.
         """
-        self.flash_checkpointer.async_save_engine.wait_latest_checkpoint(timeout)
+        self.flash_checkpointer.async_save_engine.wait_latest_checkpoint(timeout, max_steps)
 
     def _fix_zero3_gather_all_parameters(self) -> None:
         if is_deepspeed_zero3_enabled() and not hasattr(self.deepspeed, '_zero3_consolidated_16bit_state_dict_origin'):
@@ -692,7 +692,10 @@ class SwiftMixin:
             )
 
         torch.save = torch_native_save
-        success = self.flash_checkpointer.save_checkpoint_to_storage(self.state.global_step)
+        if self.state.global_step == self.state.max_steps:
+            success = self.flash_checkpointer.save_checkpoint_to_storage(self.state.global_step, True)
+        else:
+            success = self.flash_checkpointer.save_checkpoint_to_storage(self.state.global_step)
         if not success:
             logger.info(f'Skip saving the checkpoint of step {self.state.global_step} '
                         'because the latest checkpoint is not finished.')

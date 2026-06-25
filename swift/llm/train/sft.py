@@ -274,8 +274,8 @@ class SwiftSft(SwiftPipeline, TunerMixin):
             trainer.train(resume_checkpoint)
         finally:
             res = self._save_trainer_state(trainer)
-            if self.args.use_flash_ckpt:
-                trainer.wait_latest_checkpoint(trainer.FLASH_CKPT_WAIT_TIMEOUT)
+            if self.args.use_flash_ckpt and hasattr(trainer, 'flash_checkpointer'):
+                trainer.wait_latest_checkpoint(trainer.FLASH_CKPT_WAIT_TIMEOUT, trainer.state.global_step)
 
         return res
 
