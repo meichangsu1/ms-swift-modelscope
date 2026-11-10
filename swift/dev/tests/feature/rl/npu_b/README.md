@@ -14,6 +14,8 @@
 
 建议按表中顺序执行。先激活对应 Transformers 版本的环境；脚本检查版本，不一致时会停止。vLLM 用例需准备对应的 vLLM-Ascend 环境，SGLang 用例需准备支持 NPU 的 SGLang 环境。上述组合均需实际运行确认支持情况。
 
+第 12 条启用 `--model_kwargs '{"memory_efficient_init":true}'`，依赖配套的 Twinkle loader meta 初始化支持。每个节点仅全局 rank 最小的训练进程读取完整权重，其他训练 rank 创建 meta 模型，随后通过原有 FSDP 分片与广播加载参数。Ray actor 的 `LOCAL_RANK=0` 是各自可见卡中的设备索引，加载源由节点归属确定。日志中的 `Initializing model on meta` 可确认非源 rank 走到了该路径；该优化减少加载阶段的完整模型副本，实际主机内存峰值仍需运行记录确认。
+
 从仓库根目录启动，例如：
 
 ```bash
@@ -36,6 +38,8 @@ bash swift/dev/tests/feature/rl/npu_b/case_03_qwen35_full_fsdp_sync.sh
 第 5 条采用最新约定的 ModelScope 短视频子集 `MTEB/Video-MME_short`，不需要完整 Video-MME 的视频 ZIP。选择题的参考答案转换为 `\boxed{选项字母}`，与 `--orm accuracy` 的解析方式配合。
 
 每次启动自动准备所需条数的 JSONL，输出到 `$DATA_ROOT/prepared/grpo_npu`；已准备且源文件未变化的数据会复用。转换依赖 `pyarrow` 和 `Pillow`。输入仅包含用户问题，参考答案保留在 `solution` 中，不拼进 prompt。导出的 JSONL 使用本机绝对媒体路径；更换数据挂载路径后应重新生成。
+
+使用数据框架默认的 `remove_unused_columns=true`；当前 `dev` 不支持设为 `false`。准备好的 JSONL 通过 `messages` 格式转换器加载，保留额外的 `solution` 和媒体字段；脚本中的 `--columns '{"solution":"solution"}'` 继续保留。
 
 可通过环境变量调整路径和运行方式：
 
@@ -61,3 +65,14 @@ DRY_RUN=1 bash swift/dev/tests/feature/rl/npu_b/case_05_qwen35_lora_sp_multimoda
 每条用例默认写入 `output/npu_grpo_b/case_XX`，保存 `console.log`、`environment.json` 和可复用的 `command.sh`。训练同时启用 TensorBoard 和 `log_completions`；最终训练产物按 recipe 的现有保存流程输出。
 
 这些脚本负责启动和留存运行记录，不会自动判定全部专项通过。实际执行时需核对训练步数、有限的 loss、并行配置及异步发布/陈旧度指标。第 5/12 条的媒体续写一致性仍需要逐次 attempt 的日志或断言；现有 `partial_ratio` 和最终 completion 不能单独证明发生过中断续写或媒体保持一致。未触发或未取证的专项记为未覆盖。
+
+SGLang 导入时报 NPU 不可见时，可以先运行不加载模型的诊断脚本：
+
+```bash
+# 第 13 条的 2＋2 分卡；第 14 条把 --trainer-npus 改为 4。
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+python swift/dev/tests/feature/rl/npu_b/diagnose_sglang_npu.py \
+    --trainer-npus 2 --sampler-npus 2
+```
+
+第 14 条同时将可见卡设为 `0,1,2,3,4,5`。指定卡号应与失败训练使用的卡号相同。诊断在独立的本地 Ray 集群中复用 Twinkle 分卡，记录 driver、sampler actor 线程及后台事件循环线程的环境和 NPU 可用性，并在后台线程导入 Engine 模块；不会实例化 Engine。若诊断通过而训练失败，还需对比原训练集群、worker 启动钩子及 Engine 后续初始化过程。

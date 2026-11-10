@@ -57,7 +57,6 @@ run_case \
     --padding_free false \
     --packing false \
     --use_hf false \
-    --remove_unused_columns false \
     --columns '{"solution":"solution"}' \
     --log_completions true \
     --eval_strategy no

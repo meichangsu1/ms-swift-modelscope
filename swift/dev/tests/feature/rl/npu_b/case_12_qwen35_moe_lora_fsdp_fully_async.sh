@@ -24,6 +24,7 @@ run_case \
     --tuner lora \
     --learning_rate 1e-4 \
     --torch_dtype bfloat16 \
+    --model_kwargs '{"memory_efficient_init":true}' \
     --gradient_checkpointing true \
     --max_steps "${MAX_STEPS:-20}" \
     --logging_steps 1 \
@@ -66,13 +67,11 @@ run_case \
     --padding_side right \
     --padding_free false \
     --packing false \
-    --language_model_only false \
     --max_pixels 262144 \
     --vllm_limit_mm_per_prompt '{"image":2}' \
     --freeze_vit true \
     --freeze_aligner true \
     --use_hf false \
-    --remove_unused_columns false \
     --columns '{"solution":"solution"}' \
     --log_completions true \
     --eval_strategy no
