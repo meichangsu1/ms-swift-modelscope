@@ -302,15 +302,14 @@ class HFHub:
                      revision: Optional[str] = None,
                      download_mode: Literal['force_redownload', 'reuse_dataset_if_exists'] = 'reuse_dataset_if_exists',
                      num_proc: Optional[int] = None,
-                     trust_remote_code: bool = True,
+                     token: Optional[str] = None,
                      **kwargs):
         from datasets import load_dataset
-        if trust_remote_code:
-            logger.warning('loading dataset %s with trust_remote_code=True: the dataset repo\'s own Python '
-                           'script will execute inside this process. Only use dataset sources you trust.',
-                           dataset_id)
         if revision is None or revision == 'master':
             revision = 'main'
+        # A token is only sent when there is one: passing `token=None` explicitly would override the
+        # credentials the hub client has already cached for the user (private / gated datasets).
+        token_kwargs = {'token': token} if token else {}
 
         def online_fn():
             return load_dataset(
@@ -321,7 +320,7 @@ class HFHub:
                 revision=revision,
                 download_mode=download_mode,
                 num_proc=num_proc,
-                trust_remote_code=trust_remote_code)
+                **token_kwargs)
 
         def offline_fn():
             # Same loader as online, but the forced-offline mode set by the fallback wrapper makes
@@ -333,8 +332,7 @@ class HFHub:
                 name=subset_name,
                 split=split,
                 streaming=streaming,
-                num_proc=num_proc,
-                trust_remote_code=trust_remote_code)
+                num_proc=num_proc)
 
         return _load_with_cache_fallback(
             online_fn, offline_fn, describe=f'hf://{dataset_id}:{subset_name}#{split}')
@@ -406,7 +404,8 @@ def safe_snapshot_download(model_id_or_path: str,
             '*.ot', '*.h5'
         ]
     if not download_model:
-        ignore_patterns += ['*.bin', '*.safetensors']
+        # Rebind instead of `+=`: the caller's list must not be extended in place.
+        ignore_patterns = [*ignore_patterns, '*.bin', '*.safetensors']
     hub = get_hub(use_hf)
     if model_id_or_path.startswith('~'):
         model_id_or_path = os.path.abspath(os.path.expanduser(model_id_or_path))

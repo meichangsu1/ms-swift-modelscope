@@ -63,6 +63,39 @@ def _float_value(raw: Any, default: float) -> float:
         raise ValueError(f'expected a number, got {raw!r}') from None
 
 
+def _cadence_gate(stage: Any, inputs: Dict[str, Any]) -> bool:
+    """Whether a cadence-gated stage (weight_sync / checkpoint) fires this circle.
+
+    ``cadence`` is declared in optimizer STEPS, so the stage accumulates the
+    ``optimizer_steps`` of each wired ``step`` receipt and fires only when the
+    cumulative count crosses a new multiple of cadence: a 9-step loop with
+    cadence=3 publishes / saves at steps 3, 6 and 9, not every circle. A
+    cadence of 1 (the default) always fires, which keeps a graph that never set
+    the knob -- and the GRPO circle's every-round weight push -- unchanged.
+
+    cadence>1 with no step receipt wired fails loudly: the gate would have no
+    step count to divide, and silently firing every circle is exactly the
+    dead-parameter behaviour the cadence knob must not have.
+    """
+    cadence = _int_value(stage.params.get('cadence'), 1)
+    if cadence <= 1:
+        return True
+    receipt = inputs.get('step')
+    if not isinstance(receipt, dict):
+        raise ComponentError(
+            f'{stage.node_id}: cadence={cadence} counts optimizer steps from the wired '
+            f'step receipt; wire train_step.step -> {stage.node_id}.step')
+    # Lazy per-instance state (survives the per-round receipt replacement):
+    # cumulative optimizer steps seen, and the last boundary fired at.
+    state = stage.__dict__.setdefault('_cadence_state', {'cumulative': 0, 'fired': 0})
+    state['cumulative'] += _int_value(receipt.get('optimizer_steps'), 0)
+    boundary = (state['cumulative'] // cadence) * cadence
+    if boundary > state['fired']:
+        state['fired'] = boundary
+        return True
+    return False
+
+
 def _aligned_slice(value: Any, start: int, stop: int) -> Any:
     """Slice one sample-aligned loss kwarg alongside a micro batch.
 
@@ -221,24 +254,55 @@ class TrainStepStage(StageComponent):
                                                 gradient_accumulation_steps=ga))
                 if is_grad_sync_boundary(self._micro_step, ga):
                     optimizer_steps += 1
-        loss_value = None
+        metric_row = None
         metric = getattr(model, 'calculate_metric', None)
         if callable(metric):
             try:
                 metric_row = metric(True)
-                loss_value = metric_row.get('loss') if isinstance(metric_row, dict) else None
             except Exception as exc:  # noqa
                 # A metric read-back failure must not fail the finished step,
                 # but it must stay visible: a silent None here reads as "the
                 # training produced no loss" in the node's preview.
                 logger.warning('%s: calculate_metric failed: %r', self.node_id, exc)
-                loss_value = None
+                metric_row = None
+        # The curve lives on the component instance: the receipt is replaced
+        # every round, the history must survive it. The x axis is CUMULATIVE
+        # optimizer steps (a GA-wrapped round counts its real steps); every
+        # scalar calculate_metric reports rides the same lane, so algorithm
+        # metrics plot next to the loss without a second channel. The native
+        # metrics return numbers as STRINGS ('%.5f' formatting) -- coerce, the
+        # curve needs values the SVG axis can scale.
+        def _numeric(value: Any) -> Any:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, (int, float)):
+                return value
+            if isinstance(value, str):
+                try:
+                    return float(value)
+                except ValueError:
+                    return None
+            return None
+
+        history = getattr(self, '_metric_history', None)
+        if history is None:
+            history = self._metric_history = []
+        self._steps_done = getattr(self, '_steps_done', 0) + optimizer_steps
+        scalars: Dict[str, Any] = {}
+        if isinstance(metric_row, dict):
+            for key, value in metric_row.items():
+                number = _numeric(value)
+                if number is not None:
+                    scalars[str(key)] = number
+        if scalars:
+            point = {'optimizer_steps': self._steps_done, **scalars}
+            history.append(point)
         return {'step': {'status': 'completed', 'optimizer_steps': optimizer_steps,
                          'micro_step': getattr(self, '_micro_step', 0)},
                 'model': model,
                 'optimizer_steps': optimizer_steps,
                 'then': {'done': True},
-                'metric': {'values': {'loss': loss_value}} if loss_value is not None else None}
+                'metric': {'values': scalars, 'history': list(history)} if scalars else None}
 
 
 class WeightSyncStage(StageComponent):
@@ -258,6 +322,8 @@ class WeightSyncStage(StageComponent):
     type = 'weight_sync'
 
     def invoke(self, inputs: Dict[str, Any], batch: Any) -> Dict[str, Any]:
+        if not _cadence_gate(self, inputs):
+            return {'sync': {'state': 'skipped', 'reason': 'cadence'}}
         model = inputs.get('model')
         targets = slot_values(inputs.get('targets'))
         if model is None or not targets:
@@ -341,6 +407,8 @@ class CheckpointStage(StageComponent):
     type = 'checkpoint'
 
     def invoke(self, inputs: Dict[str, Any], batch: Any) -> Dict[str, Any]:
+        if not _cadence_gate(self, inputs):
+            return {'artifact': {'state': 'skipped', 'reason': 'cadence'}}
         model = inputs.get('model')
         if model is None:
             raise ComponentError(f'{self.node_id}: checkpoint needs a wired model')

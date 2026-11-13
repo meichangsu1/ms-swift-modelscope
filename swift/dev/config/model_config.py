@@ -12,7 +12,7 @@ class ModelConfig:
     model: Optional[str] = None
     model_type: Optional[str] = None
     model_revision: Optional[str] = None
-    task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'reranker', 'generative_reranker', None] = None
+    task_type: Literal["causal_lm", "seq_cls", "embedding", "reranker", "generative_reranker", "decision", None] = None
     torch_dtype: Literal['bfloat16', 'float16', 'float32', None] = None
     attn_impl: Optional[str] = None
     experts_impl: Optional[str] = None
@@ -27,8 +27,6 @@ class ModelConfig:
     # Extra kwargs forwarded to from_pretrained (JSON object or file); the escape hatch for a model
     # whose loading needs something this config does not name.
     model_kwargs: Optional[Dict[str, Any]] = None
-    # Ascend-specific model patches, on by default and only consulted on NPU.
-    enable_npu_model_patch: bool = True
     # Vision-tower attention, which often supports a different set than the language tower.
     vit_attn_impl: Optional[str] = None
     # Vision preprocessing overrides (min_pixels, max_pixels, fps, ...) keyed by the lowercase

@@ -87,6 +87,7 @@ def _load_kwargs(dataset_config: DatasetConfig) -> dict:
                          'Pass `columns` to override individual names instead.')
     return dict(
         seed=dataset_config.data_seed,
+        augment_configs=_augment_configs(dataset_config),
         num_proc=dataset_config.dataset_num_proc,
         load_from_cache_file=dataset_config.load_from_cache_file,
         streaming=dataset_config.streaming,
@@ -95,12 +96,33 @@ def _load_kwargs(dataset_config: DatasetConfig) -> dict:
         shuffle_buffer_size=dataset_config.shuffle_buffer_size,
         use_hf=dataset_config.use_hf,
         hub_token=dataset_config.hub_token,
+        trust_remote_code=dataset_config.trust_remote_code,
         download_mode=dataset_config.download_mode,
         columns=dataset_config.columns,
         strict=dataset_config.strict,
         model_name=dataset_config.model_name,
         model_author=dataset_config.model_author,
     )
+
+
+def _augment_configs(dataset_config: DatasetConfig) -> Optional[Dict[str, Any]]:
+    if (
+        dataset_config.decision_drop_instructions <= 0
+        and dataset_config.decision_subsample_options <= 0
+        and dataset_config.decision_state_as_text <= 0
+        and not dataset_config.decision_shuffle_fields
+    ):
+        return None
+    from swift.dev.dataset.preprocessor import DecisionAugmentConfig
+
+    return {
+        "decision": DecisionAugmentConfig(
+            drop_instructions=dataset_config.decision_drop_instructions,
+            subsample_options=dataset_config.decision_subsample_options,
+            state_as_text=dataset_config.decision_state_as_text,
+            shuffle_fields=dataset_config.decision_shuffle_fields,
+        )
+    }
 
 
 def _load_cached_datasets(dataset_config: DatasetConfig, template_config: Any) -> tuple:
@@ -180,6 +202,7 @@ def _build_split_loader(raw: Any,
             packing_strategy=dataset_config.packing_strategy,
             num_proc=dataset_config.packing_num_proc,
             strict=dataset_config.strict,
+            multiprocessing_context=dataset_config.dataloader_multiprocessing_context,
             data_seed=dataset_config.data_seed)
 
     batch_size = (train_config.per_device_eval_batch_size if is_val else train_config.per_device_train_batch_size)
@@ -354,7 +377,7 @@ def _encode(raw: Any, template: Any, *, mode: Literal['lazy', 'eager', 'stream']
 
 
 def _pack(dataset: Any, template: Any, *, streaming: bool, packing_length: Optional[int], packing_strategy: str,
-          num_proc: int, strict: bool, data_seed: int = 0) -> Any:
+          num_proc: int, strict: bool, multiprocessing_context: Optional[str] = None, data_seed: int = 0) -> Any:
     """Pack an encoded dataset for efficient training (map-style or iterable)."""
     from swift.dev.dataset import IterablePackingDataset, PackingDataset
 
@@ -371,6 +394,7 @@ def _pack(dataset: Any, template: Any, *, streaming: bool, packing_length: Optio
         packing_length=length,
         packing_strategy=packing_strategy,
         strict=strict,
+        multiprocessing_context=multiprocessing_context,
         **seed_kwargs)
 
 
@@ -381,8 +405,12 @@ def load_prompt_only_rows(dataset_config: DatasetConfig, max_rows: Optional[int]
     ``val_dataset`` wins outright; otherwise only the eval slice of ``dataset`` is used (ratio=0 runs
     all) -- legacy infer's ``_prepare_val_dataset`` semantics.
     """
-    from swift.dev.dataset import load_dataset
-
+    from swift.dev.dataset import load_dataset, register_dataset_info
+    # The custom registrations must land before the path/type resolution below, exactly as
+    # build_dataset does: a val/prompt path registered only in a --custom_dataset_info file
+    # otherwise falls back to plain rows (its family preprocessor never runs).
+    for info_path in dataset_config.custom_dataset_info:
+        register_dataset_info(info_path, exist_ok=True)
     kwargs = _load_kwargs(dataset_config)
     # legacy infer: val_dataset loads whole (its own shuffle flag; interleave_prob -- a train-mixing
     # knob -- popped); the eval slice of --dataset uses dataset_shuffle, before the max_rows cut
@@ -436,6 +464,12 @@ def build_prompt_dataloader(prompts: List[List[dict]],
     return DataLoader(
         dataset,
         batch_size=batch_size,
+        # The recipes consume a narrower epoch tail (a small dataset, or its last batch): the rollout
+        # budget counts it and the loop trains on it. min_batch_size=1 declares that here, because
+        # twinkle's driver-side ray-mode default (min_batch_size=batch_size) would silently drop every
+        # narrower batch -- a dataset smaller than one generation batch then yields ZERO batches and
+        # the run "completes" without a single optimizer step.
+        min_batch_size=1,
         data_seed=seed,
         num_workers=0,
         collate_fn=_identity_collate,

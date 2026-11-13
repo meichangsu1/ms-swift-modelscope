@@ -77,7 +77,9 @@ def test_offline_entry_submits_full_and_short_updates(tmp_path, preference, mode
     rows = [{"input_ids": [index], "labels": [index]} for index in range(update_batch_size + train_batch_size)]
     batches = [rows[index : index + train_batch_size] for index in range(0, len(rows), train_batch_size)]
     cluster = SimpleNamespace(
-        model=model, dataloader=batches, total_opt_steps=2, eval_dataloader=None, template=None, processor=None
+        model=model, dataloader=batches, total_opt_steps=2, eval_dataloader=None, template=None, processor=None,
+        # supervised's evaluation reads this (whole-batch eval task gate); None = a plain task.
+        forward_task=None
     )
     if preference:
         template = SimpleNamespace(
@@ -254,7 +256,12 @@ def test_preference_auxiliary_forwards_use_per_call_micro_batch_size(rl_type, sh
         }
     )
     encoder = PreferenceBatchEncoder(model, template, rl_type=rl_type, reference=reference)
-    for batch_size in (4, 1, 4):  # Training -> evaluation -> training on the same encoder.
+    # KTO cannot form its mismatched KL point from a single row -- batch >= 2 is intrinsic to the
+    # unpaired objective (see test_algorithms_e2e::test_offline_preference_family_e2e), and the encoder
+    # fails loudly on a degenerate one-row batch rather than silently self-pairing. dpo pairs chosen and
+    # rejected within a row, so it still exercises the true single-row evaluation step.
+    eval_batch_size = 2 if rl_type == "kto" else 1
+    for batch_size in (4, eval_batch_size, 4):  # Training -> evaluation -> training on the same encoder.
         calls.clear()
         rows = [{"messages": [{"role": "assistant", "content": str(i + 1)}]} for i in range(batch_size)]
         kwargs = encoder(rows, micro_batch_size=batch_size)
@@ -408,10 +415,12 @@ def test_distill_prepares_one_global_batch_per_update(use_student, colocate, bat
         generation_sizes.append(len(prompts) * num_samples)
         start = generated[0]
         generated[0] += len(prompts) * num_samples
-        return [
+        samples = [
             SimpleNamespace(encoded={"input_ids": [i]}, messages=[], prompt=[], extra={})
             for i in range(start, generated[0])
         ]
+        # generate's contract is (samples, encodings); loops re-attach them.
+        return samples, [sample.encoded for sample in samples]
 
     monkeypatch.setattr(offload, "offload_for_rollout", borrow)
     monkeypatch.setattr(offload, "sleep_for_rollout", lambda *args: None)
@@ -480,11 +489,13 @@ def test_distill_selects_each_update_and_advances_only_the_off_policy_cursor(mon
 
     def generate(prompts, *, num_samples, **kwargs):
         generated_prompts.append(prompts)
-        return [
+        samples = [
             SimpleNamespace(encoded={"input_ids": [-int(messages[0]["content"]) - 1]}, messages=messages, extra=extra)
             for messages, extra in zip(prompts, kwargs["prompt_extras"])
             for _ in range(num_samples)
         ]
+        # generate's contract is (samples, encodings); loops re-attach them.
+        return samples, [sample.encoded for sample in samples]
 
     def forward_kwargs(rows, use_student):
         sources.append(use_student)
@@ -539,7 +550,9 @@ def test_distill_generates_only_four_rows_for_a_global_batch_of_four():
     def generate(prompts, *, num_samples, **kwargs):
         ids = [int(messages[0]["content"]) for messages in prompts for _ in range(num_samples)]
         generated.append(ids)
-        return [SimpleNamespace(encoded={"input_ids": [i]}, messages=[], extra={}) for i in ids]
+        samples = [SimpleNamespace(encoded={"input_ids": [i]}, messages=[], extra={}) for i in ids]
+        # generate's contract is (samples, encodings); loops re-attach them.
+        return samples, [sample.encoded for sample in samples]
 
     # One input batch has three prompts, but it must result in three separate generation/update calls.
     batch = [{"messages": [{"role": "user", "content": str(i)}]} for i in range(3)]
@@ -578,9 +591,19 @@ def test_distill_generates_only_four_rows_for_a_global_batch_of_four():
 
 
 @pytest.mark.parametrize(
-    "sampler_mode,lmbda,expected", [("colocate", 1.0, 6), ("disaggregated", 0.5, 6), ("disaggregated", 1.0, 7)]
+    "sampler_mode,lmbda,expected", [("colocate", 1.0, 4), ("disaggregated", 0.5, 4), ("disaggregated", 1.0, 7)]
 )
 def test_distill_entry_budgets_updates_across_prompt_loader_batches(monkeypatch, sampler_mode, lmbda, expected):
+    """The budget must match what the loops actually do, not a nicer arithmetic.
+
+    5 prompts, generation_batch_size=2, num_generations=3 -> per-epoch batches of [6, 6, 3]
+    samples; 2 epochs -> [6, 6, 3, 6, 6, 3]. Non-streaming (colocate, or disaggregated with
+    lmbda != 1) replays each batch and drops its tail, so each 6-sample batch is one update
+    (GBS = 2 * 2 = 4) and each 3-sample batch none: 4 updates. Streaming (disaggregated,
+    lmbda == 1) combines all 30 samples first: floor(30 / 4) = 7. lmbda itself does not enter
+    the budget -- the GKD replay fraction is a loop-side concern, so a sub-1 lmbda just leaves
+    the budget loose, never tight.
+    """
     recipe = import_module("swift.dev.recipe.distill.run_distill")
     prompts = [[{"role": "user", "content": str(i)}] for i in range(5)]
     monkeypatch.setattr(recipe, "prompt_rows_from_dataset", lambda config: ([], prompts, [{}] * 5))
@@ -624,7 +647,9 @@ def test_ppo_colocate_preserves_a_single_prompt_pass_for_both_models(monkeypatch
     def generate(prompts, *, num_samples, **kwargs):
         start = generated[0]
         generated[0] += len(prompts) * num_samples
-        return [SimpleNamespace(encoded={"input_ids": [i]}) for i in range(start, generated[0])]
+        samples = [SimpleNamespace(encoded={"input_ids": [i]}) for i in range(start, generated[0])]
+        # generate's contract is (samples, encodings); loops re-attach them.
+        return samples, [sample.encoded for sample in samples]
 
     def gae(cluster, reward, config, samples, *args):
         signals = [[float(sample.encoded["input_ids"][0])] for sample in samples]

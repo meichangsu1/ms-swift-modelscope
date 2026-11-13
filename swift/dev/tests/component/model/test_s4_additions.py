@@ -17,10 +17,11 @@ from types import SimpleNamespace
 import pytest
 
 from swift.dev.model.loader.base import (
-    MODEL_ALIASES,
     MODEL_MAPPING,
     get_model_loader,
+    match_model_type,
     match_model_types_by_architectures,
+    resolve_template,
 )
 
 
@@ -28,13 +29,11 @@ from swift.dev.model.loader.base import (
 
 
 def test_every_registered_family_and_alias_resolves():
-    """Each of the loader files' families is live in MODEL_MAPPING and resolves; each alias lands
-    on the family it declares. A dead key here is a family silently unreachable from the CLI."""
+    """Each of the loader files' families is live in MODEL_MAPPING and resolves. A dead key here
+    is a family silently unreachable from the CLI."""
     assert len(MODEL_MAPPING) > 100, f'registry unexpectedly small: {len(MODEL_MAPPING)}'
     for model_type in MODEL_MAPPING:
         assert get_model_loader(model_type) is MODEL_MAPPING[model_type], model_type
-    for alias, target in MODEL_ALIASES.items():
-        assert get_model_loader(alias) is get_model_loader(target), alias
     with pytest.raises(ValueError, match='not registered'):
         get_model_loader('no_such_family_xyz')
 
@@ -45,6 +44,28 @@ def test_ambiguous_architecture_returns_every_candidate():
     assert get_model_loader('qwen2').architectures == ['Qwen2ForCausalLM']
     assert get_model_loader('qwen2_gte').architectures == ['Qwen2ForCausalLM']
     assert match_model_types_by_architectures(['Qwen2ForCausalLM']) == ['qwen2', 'qwen2_gte']
+
+
+def test_thinking_variants_route_by_checkpoint_name():
+    """A variant template is its own thin family: the Thinking checkpoints of Qwen3-VL prefill the
+    think opener at the prompt and the Instruct ones do not, while the two ship the same
+    architecture. So the family is selected by checkpoint name only -- a variant that declared the
+    architecture would make the reverse lookup ambiguous -- and each id must land on exactly the
+    family the split declares, since a duplicated id is shadowed by whichever registered first.
+    """
+    routes = {
+        'Qwen/Qwen3-VL-2B-Instruct': ('qwen3_vl', 'qwen3_vl'),
+        'Qwen/Qwen3-VL-2B-Thinking': ('qwen3_vl_thinking', 'qwen3_vl_thinking'),
+        'Qwen/Qwen3-VL-30B-A3B-Instruct': ('qwen3_vl_moe', 'qwen3_vl'),
+        'Qwen/Qwen3-VL-30B-A3B-Thinking': ('qwen3_vl_moe_thinking', 'qwen3_vl_thinking'),
+    }
+    for model_id, (family, template) in routes.items():
+        assert match_model_type(model_id) == family, model_id
+        assert resolve_template(family) == template, family
+    for family in ('qwen3_vl_thinking', 'qwen3_vl_moe_thinking'):
+        assert get_model_loader(family).architectures == [], family
+        # the MoE variant speaks the very template the dense one declares
+        assert resolve_template(family) == 'qwen3_vl_thinking', family
 
 
 # --- family declarations (S4-04 / S4-05 / S4-06 / S4-08) ---------------------------------------

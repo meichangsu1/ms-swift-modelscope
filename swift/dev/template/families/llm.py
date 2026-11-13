@@ -45,11 +45,23 @@ class GMETemplate(Qwen2VLTemplate):
             inputs.messages.append({"role": "assistant", "content": ""})
         return inputs
 
+    def _swift_encode(self, inputs: StdTemplateInputs):
+        res, loss, answer_len = super()._swift_encode(inputs)
+        # modeling_gme_qwen2vl.py::embed hard-codes '...<|im_start|>assistant\n<|endoftext|>' as the
+        # prompt tail; at inference the trailing empty assistant is the generation prompt, so the
+        # suffix never lands and the last-token pooling head would read the newline instead.
+        if not self.is_training and (not res or res[-1] != "<|endoftext|>"):
+            res.append("<|endoftext|>")
+            loss.append(0.0)
+        return res, loss, answer_len
+
 
 register_template(QwenTemplateMeta(MLLMTemplateType.qwen2_gme, template_cls=GMETemplate, suffix=["<|endoftext|>"]))
 
 
 class JinaRerankerM0Template(Qwen2VLTemplate):
+    SCORE_TOKEN_ID = 100
+
     def _preprocess_inputs(self, inputs: StdTemplateInputs) -> None:
         super()._preprocess_inputs(inputs)
         instruction = ""
@@ -58,9 +70,24 @@ class JinaRerankerM0Template(Qwen2VLTemplate):
             inputs.system = None
         query = inputs.messages[0]["content"]
         document = inputs.messages[1]["content"]
-        user_message = instruction + "\n" + "**Query**:\n" + query + "\n" + "**Document**:\n" + document
-        inputs.messages = [{"role": "user", "content": user_message}]
+        # modeling.py::formatting_prompts_func joins document, then query, each as "**X**:\n<text>",
+        # and puts the optional prefix on its own line in front -- do not reorder to query-first.
+        parts = []
+        if instruction:
+            parts.append(instruction)
+        parts.append("**Document**:\n" + document)
+        parts.append("**Query**:\n" + query)
+        inputs.messages = [{"role": "user", "content": "\n".join(parts)}]
         return inputs
+
+    def _swift_encode(self, inputs: StdTemplateInputs):
+        res, loss, answer_len = super()._swift_encode(inputs)
+        # compute_score appends the model's score token to every pair after tokenization; the
+        # linear head reads the hidden state of that token, so the sequence must end with it.
+        if not self.is_training and self.SCORE_TOKEN_ID not in (res[-1:] or []):
+            res.append([self.SCORE_TOKEN_ID])
+            loss.append(0.0)
+        return res, loss, answer_len
 
 
 register_template(
@@ -81,21 +108,25 @@ register_template(
     TemplateMeta(
         LLMTemplateType.baichuan_m1,
         prefix=[],
-        prompt=["<C_Q>{{QUERY}}<C_A>"],
+        prompt=["<C_Q>{{QUERY}}"],
+        response_opener=["<C_A>"],
         chat_sep=[],
-        suffix=["<C_A>"],
+        suffix=[],
         system_prefix=["<B_SYS>{{SYSTEM}}"],
-        default_system=DEFAULT_SYSTEM,
     )
 )
 
+# The official jinja renders a system message as an empty string (the format has no
+# system slot) and emits no bos/eos.
 register_template(
     TemplateMeta(
         LLMTemplateType.numina,
-        prefix=[["bos_token_id"]],
-        prompt=["### Problem: {{QUERY}}\n### Solution: "],
+        prefix=[],
+        prompt=["### Problem: {{QUERY}}\n"],
+        response_opener=["### Solution: "],
         chat_sep=["\n"],
-        system_prefix=[["bos_token_id"], "{{SYSTEM}}"],
+        suffix=[],
+        system_prefix=[],
     )
 )
 
@@ -104,6 +135,10 @@ register_template(
         LLMTemplateType.mistral_nemo,
         prefix=["<s>[INST] "],
         prompt=["{{SYSTEM}}\n\n", "{{QUERY}}[/INST]"],
+        # the jinja opens every response with a space after '[/INST]', but leaves the generation
+        # prompt ending at '[/INST]'
+        response_opener=[" "],
+        opener_on_generation_prompt=False,
         chat_sep=["</s>[INST] "],
         suffix=["</s>"],
     )
@@ -118,7 +153,29 @@ register_template(
     )
 )
 
-register_template(TemplateMeta(LLMTemplateType.yuan, prefix=[], prompt=["{{QUERY}}<sep>"], chat_sep=None))
+class YuanTemplate(Template):
+    def _swift_encode(self, inputs: StdTemplateInputs):
+        res_context_list, loss_scale_list, answer_len = super()._swift_encode(inputs)
+        if not self.is_training:
+            # The official jinja ends the conversation's last message with <sep> instead of
+            # <n>; during inference that last message is the final query block.
+            last = res_context_list[-1] if res_context_list else None
+            if isinstance(last, str) and last.endswith("<n>"):
+                res_context_list[-1] = last[: -len("<n>")] + "<sep>"
+        return res_context_list, loss_scale_list, answer_len
+
+
+register_template(
+    TemplateMeta(
+        LLMTemplateType.yuan,
+        prefix=[],
+        prompt=["{{QUERY}}<n>"],
+        chat_sep=["<n>"],
+        suffix=["<sep>"],
+        system_prefix=["{{SYSTEM}}\n"],
+        template_cls=YuanTemplate,
+    )
+)
 register_template(
     TemplateMeta(
         LLMTemplateType.ziya,
@@ -141,13 +198,8 @@ register_template(
 register_template(
     Llama3_2TemplateMeta(
         LLMTemplateType.skywork_o1,
-        default_system=(
-            "You are Skywork-o1, a thinking model developed by Skywork AI, specializing in solving complex problems "
-            "involving mathematics, coding, and logical reasoning through deep thought. When faced with a user's "
-            "request, you first engage in a lengthy and in-depth thinking process to explore possible solutions to "
-            "the problem. After completing your thoughts, you then provide a detailed explanation of the solution "
-            "process in your response."
-        ),
+        # no baked-in default system: the official jinja renders only the date block when the
+        # conversation carries no system message, and callers pass their own system otherwise
     )
 )
 
@@ -183,9 +235,12 @@ register_template(
     TemplateMeta(
         LLMTemplateType.zephyr,
         prefix=[],
-        prompt=["<|user|>\n{{QUERY}}</s>\n<|assistant|>\n"],
+        # the opener belongs to the assistant turn: consecutive user messages render their own
+        # query blocks and share one opener, the way the official jinja does
+        prompt=["<|user|>\n{{QUERY}}</s>\n"],
+        response_opener=["<|assistant|>\n"],
         chat_sep=["</s>\n"],
-        suffix=["</s>"],
+        suffix=["</s>\n"],
         system_prefix=["<|system|>\n{{SYSTEM}}</s>\n"],
     )
 )
@@ -255,22 +310,15 @@ register_template(
     )
 )
 
-C4AI_SYSTEM = (
-    "You are Command-R, a brilliant, sophisticated, AI-assistant trained to assist human users by "
-    "providing thorough responses.You are trained by Cohere."
-)
 register_template(
     TemplateMeta(
         LLMTemplateType.c4ai,
         prefix=["<BOS_TOKEN>"],
-        prompt=[
-            "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{{QUERY}}<|END_OF_TURN_TOKEN|>"
-            "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
-        ],
+        prompt=["<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{{QUERY}}<|END_OF_TURN_TOKEN|>"],
+        response_opener=["<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"],
         chat_sep=["<|END_OF_TURN_TOKEN|>"],
         suffix=["<|END_OF_TURN_TOKEN|>"],
-        default_system=C4AI_SYSTEM,
-        system_prefix=["<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{{SYSTEM}}<|END_OF_TURN_TOKEN|"],
+        system_prefix=["<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{{SYSTEM}}<|END_OF_TURN_TOKEN|>"],
     )
 )
 
@@ -286,16 +334,44 @@ register_template(
 
 _wizardlm2_system = (
     "A chat between a curious user and an artificial intelligence assistant. "
-    "The assistant gives helpful, detailed, and polite answers to the user's questions. "
+    "The assistant gives helpful, detailed, and polite answers to the user's questions."
 )
+
+
+class WizardLM2MoeTemplate(Template):
+    def _swift_encode(self, inputs: StdTemplateInputs):
+        # the jinja prefixes the first query with ' USER: ' and every later one with '\nUSER: ',
+        # so a run of consecutive users becomes several USER lines under one ASSISTANT opener
+        seen_user = False
+        for message in inputs.messages:
+            if message['role'] == 'user' and isinstance(message.get('content'), str):
+                prefix = '\nUSER: ' if seen_user else ' USER: '
+                message['content'] = prefix + message['content'].strip()
+                seen_user = True
+        return super()._swift_encode(inputs)
+
+    def _get_response_prefix(self, inputs=None):
+        explicit = None if inputs is None else inputs.chat_template_kwargs.get('response_prefix')
+        if explicit is not None:
+            return explicit
+        if self.response_prefix is not None:
+            return self.response_prefix
+        # the generation prompt ends with ' ASSISTANT:' (no trailing space)
+        return ' ASSISTANT:'
+
+
 register_template(
     TemplateMeta(
         LLMTemplateType.wizardlm2_moe,
         prefix=["{{SYSTEM}}"],
-        prompt=["USER: {{QUERY}} ASSISTANT:"],
+        prompt=["{{QUERY}}"],
+        response_opener=[" ASSISTANT: "],
+        # the generation prompt carries ' ASSISTANT:' alone (see _get_response_prefix)
+        opener_on_generation_prompt=False,
         chat_sep=["</s>"],
         suffix=["</s>"],
         default_system=_wizardlm2_system,
+        template_cls=WizardLM2MoeTemplate,
     )
 )
 
@@ -309,23 +385,15 @@ register_template(
     )
 )
 
-AYA_SYSTEM = (
-    "You are Aya, a brilliant, sophisticated, multilingual AI-assistant trained to assist human users by "
-    "providing thorough responses. You are able to interact and respond to questions in 23 languages and "
-    "you are powered by a multilingual model built by Cohere For AI."
-)
 register_template(
     TemplateMeta(
         LLMTemplateType.aya,
         prefix=["<BOS_TOKEN>"],
-        prompt=[
-            "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{{QUERY}}<|END_OF_TURN_TOKEN|>"
-            "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
-        ],
+        prompt=["<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{{QUERY}}<|END_OF_TURN_TOKEN|>"],
+        response_opener=["<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"],
         chat_sep=["<|END_OF_TURN_TOKEN|>"],
         suffix=["<|END_OF_TURN_TOKEN|>"],
-        default_system=AYA_SYSTEM,
-        system_prefix=["<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{{SYSTEM}}<|END_OF_TURN_TOKEN|"],
+        system_prefix=["<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{{SYSTEM}}<|END_OF_TURN_TOKEN|>"],
     )
 )
 
@@ -334,8 +402,10 @@ register_template(
         LLMTemplateType.ling,
         prefix=[],
         system_prefix=["<role>SYSTEM</role>{{SYSTEM}}"],
-        prompt=["<role>HUMAN</role>{{QUERY}}<role>ASSISTANT</role>"],
-        chat_sep=[],
+        prompt=["<role>HUMAN</role>{{QUERY}}"],
+        response_opener=["<role>ASSISTANT</role>"],
+        # turns are separated by the end-of-text marker like the final response is
+        chat_sep=["<|endoftext|>"],
         suffix=["<|endoftext|>"],
     )
 )
@@ -350,11 +420,14 @@ register_template(
 register_template(
     TemplateMeta(
         LLMTemplateType.dots1,
-        prefix=["<|system|>{{SYSTEM}}<|endofsystem|>"],
-        prompt=["<|userprompt|>{{QUERY}}<|endofuserprompt|><|response|>"],
+        prefix=["<|system|><|endofsystem|>"],
+        # the official template always renders the system block; with no system message
+        # it is empty, so prefix carries the bare block and system_prefix fills it
+        system_prefix=["<|system|>{{SYSTEM}}<|endofsystem|>"],
+        prompt=["<|userprompt|>{{QUERY}}<|endofuserprompt|>"],
+        response_opener=["<|response|>"],
         chat_sep=["<|endofresponse|>"],
         suffix=["<|endofresponse|>"],
-        default_system="You are a helpful assistant.",
     )
 )
 
@@ -397,6 +470,38 @@ register_template(
 class HyV3PreviewTemplate(Template):
     HYTK = ""
 
+    def _swift_encode(self, inputs: StdTemplateInputs):
+        # the official jinja bakes the empty thinking block into every response, history turns
+        # included; a turn that arrives with a think block already keeps it
+        block = self.template_meta.non_thinking_prefix
+        if block:
+            for message in inputs.messages:
+                if message['role'] == 'assistant':
+                    content = message.get('content')
+                    if isinstance(content, str) and not content.startswith('<think'):
+                        message['content'] = block + content
+        return super()._swift_encode(inputs)
+
+    def _remove_thinking_content(self, content: str, thinking_suffix="</think>") -> str:
+        # this family closes the block with '<slash>think{HYTK}>', not plain '</think>': the base
+        # split would miss it and the history prefix would stack on top of the block already added
+        content = content.split(f"</think{self.HYTK}>")[-1].strip()
+        return self.template_meta.history_thinking_prefix + content
+
+    def _get_response_prefix(self, inputs=None):
+        # the generation prompt carries the same block: the jinja marks it according to
+        # reasoning_effort (empty think block for no_think, the bare opener otherwise)
+        explicit = None if inputs is None else inputs.chat_template_kwargs.get('response_prefix')
+        if explicit is not None:
+            return explicit
+        if self.response_prefix is not None:
+            return self.response_prefix
+        if not self.use_chat_template:
+            return ''
+        if self._get_enable_thinking(inputs):
+            return self.template_meta.thinking_prefix or None
+        return self.template_meta.non_thinking_prefix
+
     def init_env_args(self):
         super().init_env_args()
         # reasoning_effort: "no_think", "low", "high" (deep chain-of-thought)
@@ -437,12 +542,16 @@ register_template(
         LLMTemplateType.hy_v3_preview,
         prefix=["<｜hy_begin▁of▁sentence｜>"],
         system_prefix=["<｜hy_begin▁of▁sentence｜>{{SYSTEM}}"],
-        prompt=["<｜hy_User｜>{{QUERY}}<｜hy_Assistant｜>"],
+        prompt=["<｜hy_User｜>{{QUERY}}"],
+        response_opener=["<｜hy_Assistant｜>"],
         chat_sep=["<｜hy_eos｜>"],
-        suffix=["<｜hy_eos｜>"],
+        # the official jinja closes the conversation without a trailing eos, like hy_v3
+        suffix=[],
         template_cls=HyV3PreviewTemplate,
         is_thinking=True,
         thinking_prefix="<think>",
+        # the jinja defaults to reasoning_effort=no_think and renders the empty block on every
+        # response; declaring it also keeps the default enable_thinking at False
         non_thinking_prefix="<think></think>",
         history_thinking_prefix="<think></think>",
         agent_template="hy_v3_preview",
@@ -459,9 +568,12 @@ register_template(
         LLMTemplateType.hy_v3,
         prefix=["<｜hy_begin_of_sentence:opensource｜>"],
         system_prefix=["<｜hy_begin_of_sentence:opensource｜>{{SYSTEM}}"],
-        prompt=["<｜hy_User:opensource｜>{{QUERY}}<｜hy_Assistant:opensource｜>"],
+        prompt=["<｜hy_User:opensource｜>{{QUERY}}"],
+        response_opener=["<｜hy_Assistant:opensource｜>"],
         chat_sep=["<｜hy_eos:opensource｜>"],
-        suffix=["<｜hy_eos:opensource｜>"],
+        # the official jinja closes the conversation without a trailing eos: only the
+        # separators between rounds carry '<｜hy_eos:opensource｜>'
+        suffix=[],
         template_cls=HyV3Template,
         is_thinking=True,
         thinking_prefix="<think:opensource>",
@@ -491,8 +603,11 @@ class GptTemplate(Template):
             if inputs.system is None:
                 inputs.system = self._get_gpt_oss_prefix()
             elif not inputs.system.startswith("<|start|>"):
+                # the jinja renders the developer message followed by a blank line in the gpt-oss
+                # template; the internvl variant closes it right after the instructions
+                separator = "\n\n" if self.template_meta.developer_trailing_newline else ""
                 inputs.system = self._get_gpt_oss_prefix() + (
-                    f"<|start|>developer<|message|># Instructions\n\n{inputs.system}<|end|>"
+                    f"<|start|>developer<|message|># Instructions\n\n{inputs.system}{separator}<|end|>"
                 )
             for _i, message in enumerate(messages):
                 if message["role"] == "assistant" and isinstance(message["content"], str):
@@ -503,21 +618,38 @@ class GptTemplate(Template):
 @dataclass
 class GptOssTemplateMeta(TemplateMeta):
     prefix: Prompt = field(default_factory=lambda: ["{{SYSTEM}}"])
-    prompt: Prompt = field(default_factory=lambda: ["<|start|>user<|message|>{{QUERY}}<|end|><|start|>assistant"])
+    prompt: Prompt = field(default_factory=lambda: ["<|start|>user<|message|>{{QUERY}}<|end|>"])
+    response_opener: Optional[Prompt] = field(default_factory=lambda: ["<|start|>assistant"])
     chat_sep: Optional[Prompt] = field(default_factory=lambda: ["<|end|>"])
     suffix: Prompt = field(default_factory=lambda: ["<|return|>"])
+    #: blank line between the developer instructions and '<|end|>' (gpt-oss; internvl omits it)
+    developer_trailing_newline: bool = True
 
 
 register_template(GptOssTemplateMeta(LLMTemplateType.gpt_oss, template_cls=GptTemplate))
+
+class LongchatTemplate(Template):
+    def _swift_encode(self, inputs: StdTemplateInputs):
+        # the jinja numbers user messages by their position in the conversation, which differs
+        # from the round index when several users share one round
+        index = 0
+        for message in inputs.messages:
+            if message['role'] == 'user' and isinstance(message.get('content'), str):
+                message['content'] = f'[Round {index}] USER:{message["content"]} '
+                index += 1
+        return super()._swift_encode(inputs)
+
 
 register_template(
     TemplateMeta(
         LLMTemplateType.longchat,
         prefix=[],
-        system_prefix=["SYSTEM:{{SYSTEM}}"],
-        prompt=[" [Round {{ROUND0}}] USER:{{QUERY}} ASSISTANT:"],
-        chat_sep=["</longcat_s>"],
+        system_prefix=["SYSTEM:{{SYSTEM}} "],
+        prompt=["{{QUERY}}"],
+        response_opener=["ASSISTANT:"],
+        chat_sep=["</longcat_s> "],
         suffix=["</longcat_s>"],
+        template_cls=LongchatTemplate,
     )
 )
 
@@ -526,7 +658,8 @@ register_template(
         LLMTemplateType.ling2,
         prefix=["<role>SYSTEM</role>detailed thinking off<|role_end|>"],
         system_prefix=["<role>SYSTEM</role>{{SYSTEM}}\ndetailed thinking off<|role_end|>"],
-        prompt=["<role>HUMAN</role>{{QUERY}}<|role_end|><role>ASSISTANT</role>"],
+        prompt=["<role>HUMAN</role>{{QUERY}}<|role_end|>"],
+        response_opener=["<role>ASSISTANT</role>"],
         chat_sep=["<|role_end|>"],
         suffix=["<|role_end|>"],
     )
@@ -537,9 +670,10 @@ register_template(
         LLMTemplateType.ring2,
         prefix=[],
         system_prefix=["<role>SYSTEM</role>{{SYSTEM}}"],
-        prompt=["<role>HUMAN</role>{{QUERY}}<role>ASSISTANT</role>"],
+        prompt=["<role>HUMAN</role>{{QUERY}}"],
+        response_opener=["<role>ASSISTANT</role>"],
         chat_sep=[],
-        suffix=["<|endoftext|>"],
+        suffix=[],
         is_thinking=True,
         thinking_prefix="<think>\n",
     )
@@ -550,10 +684,12 @@ register_template(
         LLMTemplateType.ring2_5,
         prefix=[],
         system_prefix=["<role>SYSTEM</role>\n{{SYSTEM}}\n\n"],
-        prompt=["<role>HUMAN</role>\n{{QUERY}}<|role_end|>\n\n<role>ASSISTANT</role>\n"],
+        prompt=["<role>HUMAN</role>\n{{QUERY}}<|role_end|>\n\n"],
+        response_opener=["<role>ASSISTANT</role>\n"],
         chat_sep=["<|role_end|>\n\n"],
         suffix=["<|role_end|>\n\n"],
         is_thinking=True,
+        strip_opener_whitespace=True,
     )
 )
 
@@ -561,6 +697,8 @@ register_template(
     QwenTemplateMeta(
         LLMTemplateType.iquestcoder,
         default_system="You are LoopCoder, a helpful assistant developed by IQuest.",
+        # the shipped jinja prints a string arguments value verbatim, like the qwen3 family
+        agent_template="qwen3",
     )
 )
 
@@ -609,11 +747,14 @@ register_template(
         template_cls=YoutuLLMTemplate,
         prefix=[["bos_token_id"]],
         system_prefix=[["bos_token_id"], "{{SYSTEM}}"],
-        prompt=["<|User|>{{QUERY}}<|Assistant|>"],
+        prompt=["<|User|>{{QUERY}}"],
+        response_opener=["<|Assistant|>"],
         chat_sep=["<|end_of_text|>"],
         suffix=["<|end_of_text|>"],
         is_thinking=True,
         non_thinking_prefix="<think>\n\n</think>\n\n",
+        # only the final response carries the empty block (see _add_non_thinking_prefix)
+        train_final_think_block="<think>\n\n</think>\n\n",
         agent_template="youtu",
     )
 )

@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # ruff: noqa: C901
+import bisect
 import hashlib
 import importlib
 import inspect
@@ -58,7 +59,17 @@ from .media import _check_path, load_audio, load_batch, load_image, rescale_imag
 from .output import AgentToolParser, OutputCodec
 from .processor import Processor, ProcessorMixin
 from .runtime import get_env_args, get_logger, retry_decorator, to_device
-from .utils import Context, ContextType, StopWordsCriteria, fetch_one, findall, get_last_user_round, split_str_parts_by
+from .utils import (
+    Context,
+    ContextType,
+    StopWordsCriteria,
+    fetch_one,
+    findall,
+    get_last_user_round,
+    merge_query_messages,
+    split_rounds,
+    split_str_parts_by,
+)
 
 logger = get_logger()
 if TYPE_CHECKING:
@@ -70,6 +81,12 @@ _RENDER_MODE: ContextVar[str] = ContextVar("template_render_mode", default="trai
 _PROCESS_LOCAL_ATTRS = ("dummy_model", "model")
 # Settings a caller may override on a derived template (``Template.replace``).
 _REPLACEABLE = frozenset({"max_length", "truncation_strategy"})
+
+#: The slots a prompt block may carry; substituted in one pass so injected payload text is never rescanned.
+_PLACEHOLDER_SYSTEM, _PLACEHOLDER_QUERY = "{{SYSTEM}}", "{{QUERY}}"
+_PLACEHOLDER_ROUND0, _PLACEHOLDER_ROUND1 = "{{ROUND0}}", "{{ROUND1}}"
+_PLACEHOLDER_RE = re.compile("|".join(
+    re.escape(name) for name in (_PLACEHOLDER_SYSTEM, _PLACEHOLDER_QUERY, _PLACEHOLDER_ROUND0, _PLACEHOLDER_ROUND1)))
 
 
 @contextmanager
@@ -122,11 +139,6 @@ class Template(ProcessorMixin):
     requires_mm_token_type_ids = False
     multimodal_graph_adapter = None
     jinja_enable_thinking_key = "enable_thinking"
-    # If True, only inject non_thinking_prefix when the previous turn is a 'user' turn.
-    # Set this in subclasses where thinking / tool_call / tool_response / follow-up
-    # assistant text live in the same logical turn (e.g. Gemma4, DeepSeekV3.1), so
-    # the assistant turn after a tool_response should NOT open a new thinking block.
-    non_thinking_prefix_only_after_user: bool = False
     model_accepts_loss_kwargs: Optional[bool] = None
 
     is_encoder_decoder = False
@@ -190,7 +202,11 @@ class Template(ProcessorMixin):
         template_meta.check_system(default_system)
         if default_system is not None:
             template_meta.default_system = default_system
+        self._explicit_enable_thinking = enable_thinking is not None
         if enable_thinking is None:
+            # The computed default only drives decode-side heuristics; the rendering markers
+            # below require an explicit opt-in to match the official jinjas, which insert a
+            # think-block marker only when thinking is explicitly disabled.
             enable_thinking = template_meta.is_thinking and not template_meta.non_thinking_prefix
         self.response_prefix = response_prefix
         self.template_meta: "TemplateMeta" = template_meta
@@ -246,7 +262,7 @@ class Template(ProcessorMixin):
             )
 
     def _validate_message_capabilities(self, messages: List[Dict[str, Any]]) -> None:
-        if len(messages) // 2 > 1 and not self.template_meta.support_multi_round:
+        if len(split_rounds(messages)) > 1 and not self.template_meta.support_multi_round:
             raise NotImplementedError(
                 f"{self.template_meta.template_type} does not support multi-round chat; refusing to drop history."
             )
@@ -256,6 +272,13 @@ class Template(ProcessorMixin):
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
         return enable_thinking
+
+    def _explicit_non_thinking(self, inputs=None) -> bool:
+        """Whether thinking was explicitly disabled, the only case the official jinjas mark."""
+        enable_thinking = None if inputs is None else inputs.chat_template_kwargs.get("enable_thinking")
+        if enable_thinking is None:
+            return self._explicit_enable_thinking and self.enable_thinking is False
+        return enable_thinking is False
 
     def _get_preserve_thinking(self, inputs=None):
         preserve_thinking = None if inputs is None else inputs.chat_template_kwargs.get("preserve_thinking")
@@ -280,11 +303,14 @@ class Template(ProcessorMixin):
             return response_prefix
         elif not self.use_chat_template:
             return ""
-        enable_thinking = self._get_enable_thinking(inputs)
-        if enable_thinking:
-            return self.template_meta.thinking_prefix
-        else:
-            return self.template_meta.non_thinking_prefix
+        if self.template_meta.non_thinking_prefix:
+            # mixed-thinking family: the official jinja marks the generation prompt only when
+            # thinking is explicitly disabled; the default render carries no marker.
+            if self._explicit_non_thinking(inputs):
+                return self.template_meta.non_thinking_prefix
+            return None
+        # thinking-only family: the official jinja prefills the think opener at the generation prompt.
+        return self.template_meta.thinking_prefix or None
 
     @property
     def loss_scale(self):
@@ -620,6 +646,10 @@ class Template(ProcessorMixin):
                 _encoded[f"anchor_{key}"] = anchor_encoded[key]
             positive = inputs.positive
             if isinstance(positive, list):
+                if not positive:
+                    raise ValueError('An embedding row has an empty `positive` list: the positive leg '
+                                     'is required (labels default to 1.0 off it), so encoding cannot '
+                                     'proceed. Provide at least one positive message pair.')
                 positive = positive[0]
             positive_encoded = self._encode_truncated(positive)
             for key in positive_encoded:
@@ -694,7 +724,38 @@ class Template(ProcessorMixin):
             problem_type = self.config.problem_type
             if problem_type == "single_label_classification":
                 labels = int(labels)
+            elif problem_type == "multi_label_classification" and isinstance(labels, (list, tuple)):
+                # The training collator is twinkle's generic batcher: it stacks per-sample values
+                # verbatim, so the multi-label ONE-HOT must exist at encode time. Raw index lists
+                # would stack into [B, n_pos] and BCE would see a rank-2 target of the wrong width
+                # (the legacy HF-side _seq_cls_data_collator's one-hot never runs in dev training).
+                one_hot = [0.0] * self.config.num_labels
+                for index in labels:
+                    one_hot[int(index)] = 1.0
+                labels = one_hot
             encoded["labels"] = labels
+        return encoded
+
+    def _decision_encode(self, inputs: TemplateInputs) -> Dict[str, Any]:
+        """Encode one decision row: the family ``_encode`` output plus its training targets.
+
+        The per-question gold distributions stay in ``target_probs`` until collate time, where the
+        decision collator flattens them into the ``[total_q, max_opt]`` ``labels`` tensor the
+        :class:`~swift.dev.model.decision_head.ScoringHead` losses consume.
+        """
+        chosen = inputs.chosen
+        encoded = self._encode_truncated(chosen)
+        if self.is_training:
+            target_probs = chosen.extra_kwargs.get("target_probs")
+            if target_probs is None:
+                # A training row without target_probs used to encode silently; the collator then
+                # omitted the whole labels tensor for an all-unlabeled batch and the failure only
+                # surfaced at loss construction with no pointer back to the data. Reject at encode
+                # time, where the offending row is still identifiable.
+                raise ValueError(
+                    'decision training rows need `target_probs` (the per-question gold '
+                    'distributions); this row carries none. Label the row, or run it as inference.')
+            encoded["target_probs"] = target_probs
         return encoded
 
     def encode(
@@ -734,7 +795,7 @@ class Template(ProcessorMixin):
         elif isinstance(sample, KTOSample):
             conversation = deepcopy(sample.conversation)
             conversation["label"] = sample.label
-            sample = TemplateInputs(chosen=conversation)
+            sample = TemplateInputs(chosen=conversation, rejected=deepcopy(sample.rejected))
             preference_mode = "kto"
         explicit_intent = intent is not None or add_generation_prompt is not None
         intent = resolve_intent(intent, add_generation_prompt)
@@ -893,17 +954,24 @@ class Template(ProcessorMixin):
         renderer = self.replace(max_length=None)
 
         def render(messages: List[Dict[str, Any]], gen_prompt: bool) -> List[int]:
+            messages = [dict(message) for message in messages]
             sample = {"messages": messages, "tools": tools} if tools else {"messages": messages}
-            intent = (
-                EncodeIntent(
-                    add_generation_prompt=gen_prompt,
-                    with_labels=False,
-                    expand_media=False,
-                )
-                if engine
-                else (INFER if gen_prompt else TRAIN)
+            # The two renders must differ ONLY in add_generation_prompt, or the appended turns are
+            # not a prefix-extension of the history. A shared no-labels intent (SCORE -> INFER)
+            # keeps the render mode constant; TRAIN would not, because the thinking policy keys on
+            # is_training and would strip the history's reasoning in one render and keep it in the
+            # other. preserve_thinking is pinned for the same reason: the banked ids carry the
+            # sampled thinking tokens verbatim, so the renders must keep them.
+            sample["chat_template_kwargs"] = {"preserve_thinking": True}
+            intent = EncodeIntent(
+                add_generation_prompt=gen_prompt,
+                with_labels=False,
+                expand_media=not engine,
             )
-            if engine and not gen_prompt:
+            # The shared no-labels intent is not TRAIN, so the encoder's implicit eos check
+            # (which keys on is_training) never fires: both render paths must pin add_eos
+            # themselves, or the appended assistant turn loses its closing token (im_end).
+            if not gen_prompt:
                 sample["add_eos"] = True
             with _rendering(intent.render_mode(backend)):
                 encoded = renderer._encode_sample(sample)
@@ -1173,6 +1241,8 @@ class Template(ProcessorMixin):
             encoded = self._embedding_encode(inputs)
         elif self.task_type in {"reranker", "generative_reranker"}:
             encoded = self._reranker_encode(inputs)
+        elif self.task_type == "decision":
+            encoded = self._decision_encode(inputs)
         else:
             raise ValueError(f"task_type: {self.task_type} is not supported.")
 
@@ -1271,6 +1341,47 @@ class Template(ProcessorMixin):
             logprobs = [self._get_seq_cls_logprobs(pred, logprobs[i], top_logprobs) for i, pred in enumerate(preds)]
         return preds, logprobs
 
+    def decode_decision(self, output, top_logprobs: int):
+        """Turn a decision (System-1) forward's ``ScoringOutput`` into per-record predictions.
+
+        Ported from legacy ``Template._decode_decision``: each record becomes its questions'
+        ``[{'index': argmax option, 'probs': masked softmax over real options}]``. Option sets are
+        small (<=16), so the whole distribution is returned rather than a ``top_logprobs`` slice
+        (the arg is kept for parity with the other decode helpers' signatures). ``logprobs`` stays
+        ``None``: a scored distribution has no token-level decoding.
+        """
+        # Lazy import: a module-level import would create a template -> model load cycle.
+        from swift.dev.model.decision_head import masked_argmax, masked_softmax
+
+        logits = output.get("logits")
+        if logits is None:
+            raise ValueError(
+                "decision decode requires outputs with logits ([total_q, max_opt]); a missing "
+                "logits means the scoring head forward is broken."
+            )
+        option_mask = output.get("option_mask")
+        if option_mask is None:
+            option_mask = torch.ones_like(logits, dtype=torch.bool)
+        probs = masked_softmax(logits, option_mask)  # [total_q, max_opt]
+        preds_idx = masked_argmax(logits, option_mask)  # [total_q]
+        counts = output.get("counts")
+        if counts is None:
+            counts = [logits.shape[0]]
+        elif isinstance(counts, torch.Tensor):
+            counts = counts.tolist()
+
+        preds = []
+        start = 0
+        for count in counts:
+            record = []
+            for j in range(start, start + int(count)):
+                mask_j = option_mask[j]
+                record.append({"index": int(preds_idx[j]), "probs": probs[j][mask_j].tolist()})
+            preds.append(record)
+            start += int(count)
+        logprobs = [None] * len(preds)
+        return preds, logprobs
+
     def decode_generate_ids(
         self, generate_ids: List[int], *, is_finished: bool = True, first_token=True, template_inputs=None, **kwargs
     ) -> Any:
@@ -1364,6 +1475,15 @@ class Template(ProcessorMixin):
         if round0 is not None:
             round1 = str(round0 + 1)
             round0 = str(round0)
+        # One pass, so payload text that happens to contain a placeholder survives verbatim:
+        # substituting one placeholder at a time rescans the text it just injected and would
+        # rewrite a user's literal '{{RESPONSE}}'.
+        replacements = {
+            name: value
+            for name, value in ((_PLACEHOLDER_SYSTEM, system), (_PLACEHOLDER_QUERY, query),
+                                (_PLACEHOLDER_ROUND0, round0), (_PLACEHOLDER_ROUND1, round1))
+            if value is not None
+        }
         for context in context_list:
             if isinstance(context, str):
                 if "{{RESPONSE}}" == context:
@@ -1371,12 +1491,9 @@ class Template(ProcessorMixin):
                     res_context_list.append(response)
                     res_context_type.append(ContextType.RESPONSE)
                     continue
-                old_str_list = ["{{SYSTEM}}", "{{QUERY}}", "{{ROUND0}}", "{{ROUND1}}"]
-                new_str_list = [system, query, round0, round1]
-                for old_str, new_str in zip(old_str_list, new_str_list):
-                    if new_str is not None and old_str in context:
-                        assert isinstance(new_str, str), f"new_str: {new_str}"
-                        context = context.replace(old_str, new_str)
+                if replacements and "{{" in context:
+                    context = _PLACEHOLDER_RE.sub(lambda match: replacements.get(match.group(0), match.group(0)),
+                                                  context)
             if len(context) == 0:
                 continue
             res_context_list.append(context)
@@ -1620,6 +1737,69 @@ class Template(ProcessorMixin):
                         "We will only replace the frontmost media_tags while keeping the subsequent media_tags."
                     )
 
+    def _tokenize_run(self, pieces: List[str]) -> Tuple[List[int], List[int]]:
+        """Tokenize adjacent string contexts as one string and map tokens back to their piece.
+
+        Tokenizing each piece on its own inserts a word-start stride at every piece boundary
+        (sentencepiece dummy prefix): the official jinja encodes the whole prompt at once and has
+        no such strides. Running the pieces together, then mapping tokens back through character
+        offsets, keeps labels/loss aligned per piece while producing the ids the jinja produces.
+
+        Returns ``(token_ids, piece_index_per_token)``. A piece that overrides ``_tokenize``
+        (custom processor kwargs) keeps the per-piece path: its offsets are not ours to assume.
+        """
+        merged = ''.join(pieces)
+        token_ids = offsets = None
+        if type(self)._tokenize is Template._tokenize:
+            try:
+                encoded = self.tokenizer(
+                    merged, add_special_tokens=False, return_attention_mask=False, return_offsets_mapping=True)
+                token_ids = encoded['input_ids']
+                offsets = encoded['offset_mapping']
+            except Exception:  # noqa: BLE001 -- slow tokenizers expose no offsets
+                token_ids = offsets = None
+        if token_ids is None or offsets is None or len(offsets) != len(token_ids):
+            return self._tokenize_run_by_prefix(merged, pieces)
+        starts = []
+        position = 0
+        for piece in pieces:
+            starts.append(position)
+            position += len(piece)
+        owners = []
+        for start, _ in offsets:
+            index = bisect.bisect_right(starts, start) - 1
+            owners.append(min(max(index, 0), len(pieces) - 1))
+        return token_ids, owners
+
+    def _tokenize_run_by_prefix(self, merged: str, pieces: List[str]) -> Tuple[List[int], List[int]]:
+        """``_tokenize_run`` for a tokenizer that exposes no offsets (slow sentencepiece).
+
+        The merged string is encoded once -- the same single call the official jinja makes -- and
+        each piece boundary is located by encoding the merged string's prefix there. A
+        left-to-right encoder yields the same ids for a prefix as for the leading part of the
+        whole string, so the boundary is trusted only when the ids match exactly; a token spanning
+        a boundary leaves the split ambiguous and each piece is encoded on its own instead (the
+        ids then differ from the jinja's, but no piece boundary can be invented).
+        """
+        token_ids = list(self._tokenize(merged))
+        bounds, position = [], 0
+        for piece in pieces[:-1]:
+            position += len(piece)
+            prefix = list(self._tokenize(merged[:position]))
+            if prefix != token_ids[:len(prefix)] or (bounds and len(prefix) < bounds[-1]):
+                token_ids, owners = [], []
+                for index, single in enumerate(pieces):
+                    ids = self._tokenize(single)
+                    token_ids += ids
+                    owners += [index] * len(ids)
+                return token_ids, owners
+            bounds.append(len(prefix))
+        owners = []
+        for index, bound in enumerate(bounds + [len(token_ids)]):
+            previous = bounds[index - 1] if index else 0
+            owners += [index] * (bound - previous)
+        return token_ids, owners
+
     def _encode_context_list(
         self, context_list: List[Context], loss_scale_list: Optional[List[float]] = None
     ) -> Tuple[List[int], List[int], List[float]]:
@@ -1631,18 +1811,28 @@ class Template(ProcessorMixin):
         loss_scale: List[float] = []
         if loss_scale_list is None:
             loss_scale_list = [0.0] * len(context_list)
-        for i, (context, loss_weight) in enumerate(zip(context_list, loss_scale_list)):
-            if isinstance(context, str):
-                token_list = self._tokenize(context)
+        index = 0
+        while index < len(context_list):
+            context = context_list[index]
+            if not isinstance(context, str):
+                token_list = list(context)
+                weights = [loss_scale_list[index]] * len(token_list)
+                index += 1
             else:
-                token_list = context
+                # A run of adjacent strings is tokenized as one string, boundary strides and all.
+                end = index
+                while end < len(context_list) and isinstance(context_list[end], str):
+                    end += 1
+                pieces = context_list[index:end]
+                piece_weights = loss_scale_list[index:end]
+                token_list, owners = self._tokenize_run(pieces)
+                weights = [piece_weights[owner] for owner in owners]
+                index = end
             input_ids += token_list
-            if loss_scale_list[i] > 0.0:
-                labels += token_list
-            else:
-                labels += [-100] * len(token_list)
+            for token, weight in zip(token_list, weights):
+                labels.append(token if weight > 0.0 else -100)
             if not is_binary_loss_scale:
-                loss_scale.extend([loss_weight] * len(token_list))
+                loss_scale.extend(weights)
         if is_binary_loss_scale:
             loss_scale = None
         return input_ids, labels, loss_scale
@@ -1668,8 +1858,9 @@ class Template(ProcessorMixin):
     def _get_std_messages(messages):
         if messages and messages[0]["role"] == "assistant":
             messages.insert(0, {"role": "user", "content": ""})  # pretrain
-        if len(messages) % 2 == 1:
-            messages.append({"role": "assistant", "content": None})  # inference
+        # no even-length padding: `_swift_encode` renders a trailing query segment as the
+        # inference generation prompt, the shape the official jinja renders with
+        # add_generation_prompt=True
 
     def _jinja_encode(self, inputs: StdTemplateInputs):
         messages = inputs.messages.copy()
@@ -1684,9 +1875,11 @@ class Template(ProcessorMixin):
         kwargs = {}
         if inputs.tools:
             kwargs["tools"] = inputs.tools
-        enable_thinking = self._get_enable_thinking(inputs)
+        enable_thinking = None if inputs is None else inputs.chat_template_kwargs.get("enable_thinking")
+        explicit_thinking = enable_thinking is not None or self._explicit_enable_thinking
+        if explicit_thinking:
+            kwargs[self.jinja_enable_thinking_key] = self._get_enable_thinking(inputs)
         if self.template_meta.is_thinking or enable_thinking:
-            kwargs[self.jinja_enable_thinking_key] = enable_thinking
             kwargs["preserve_thinking"] = self._get_preserve_thinking(inputs)
         kwargs.update(self.chat_template_kwargs)
         kwargs.update(inputs.chat_template_kwargs)
@@ -1708,41 +1901,24 @@ class Template(ProcessorMixin):
             system = self.agent_template._format_tools(tools, system, inputs.messages[0])
         return system
 
-    def _is_add_non_thinking_round(self, messages, i: int, start_idx: int):
-        message = messages[i]
-        if not (i >= start_idx and message["role"] == "assistant"):
-            return False
-        if self.non_thinking_prefix_only_after_user and not (i > 0 and messages[i - 1]["role"] == "user"):
-            return False
-        return True
-
     def _add_non_thinking_prefix(self, inputs, thinking_prefix="<think>") -> None:
         messages = inputs.messages
-        non_thinking_prefix = self.template_meta.non_thinking_prefix
-        if non_thinking_prefix:
-            # Determine the starting index for processing messages
-            # During inference or when using 'last_round' strategy, only process the last round
-            # Otherwise, process all messages (start_idx = -1 means start from the beginning)
-            if not self.is_training or self.loss_scale.base_strategy == "last_round":
-                start_idx = get_last_user_round(messages)
-            else:
-                start_idx = -1
-            for i, message in enumerate(messages):
-                if not self._is_add_non_thinking_round(messages, i, start_idx):
-                    continue
-                content = message["content"]
-                # After merge, content may be a list; only process the first element.
-                if isinstance(content, list):
-                    _add_prefix = (
-                        content
-                        and isinstance(content[0], str)
-                        and not content[0].startswith((thinking_prefix, non_thinking_prefix))
-                    )
-                    if _add_prefix:
-                        content[0] = non_thinking_prefix + content[0]
-                elif isinstance(content, str):
-                    if not content.startswith((thinking_prefix, non_thinking_prefix)):
-                        message["content"] = non_thinking_prefix + content
+        non_thinking_prefix = self.template_meta.train_final_think_block
+        if not non_thinking_prefix or not messages or messages[-1]["role"] != "assistant":
+            return
+        # The official jinjas render the empty think block on the final response only: history
+        # turns render with their thinking already stripped, tool-call turns render bare.
+        message = messages[-1]
+        content = message["content"]
+        # After merge, content may be a list; only process the first element.
+        if isinstance(content, list):
+            if content and isinstance(content[0], str) and not content[0].startswith(
+                (thinking_prefix, non_thinking_prefix)
+            ):
+                content[0] = non_thinking_prefix + content[0]
+        elif isinstance(content, str):
+            if not content.startswith((thinking_prefix, non_thinking_prefix)):
+                message["content"] = non_thinking_prefix + content
 
     def _remove_thinking_content(self, content: str, thinking_suffix="</think>") -> str:
         content = content.split(thinking_suffix)[-1].strip()
@@ -1829,7 +2005,9 @@ class Template(ProcessorMixin):
         according to their roles.
 
         Specifically, this method:
-            - Merges consecutive messages from the same role ('assistant' or 'user') to prevent downstream errors.
+            - Merges consecutive assistant messages (kept: a round is one response; consecutive user
+              messages are NOT merged -- the official jinja renders each as its own turn, and the
+              round loop in `_swift_encode` renders them the same way).
             - Detects consecutive tool-related messages following an assistant message, then formats and
             combines them using `agent_template._format_tool_responses` for structured output.
             - Updates the messages list in-place for further processing.
@@ -1854,14 +2032,43 @@ class Template(ProcessorMixin):
                 i_start = i
                 while i + 1 < len(messages) and messages[i + 1]["role"] == "tool":
                     i += 1
-                pre_message["content"], tool_content = self.agent_template._format_tool_responses(
+                agent = self.agent_template
+                agent.template_meta = self.template_meta
+                pre_message["content"], tool_content = agent._format_tool_responses(
                     pre_content, messages[i_start : i + 1]
                 )
-                # where tool_content is a List.
-                messages[i_start : i + 1] = [{"role": "tool", "content": tool_content}]
+                query_message = {"role": "tool", "content": tool_content}
+                user_end = i + 1
+                while (
+                    user_end < len(messages)
+                    and messages[user_end]["role"] == "user"
+                    and isinstance(messages[user_end]["content"], str)
+                ):
+                    user_end += 1
+                is_react = agent.keyword.action in pre_content and agent.keyword.action_input in pre_content
+                if user_end > i + 1 and self.use_chat_template:
+                    if is_react and agent.uses_react_tool_responses:
+                        merged = agent._format_react_tool_user_followup(tool_content, messages[i + 1 : user_end])
+                    else:
+                        merged = agent._format_tool_user_followup(messages[i_start : i + 1], messages[i + 1 : user_end])
+                    if merged is not None:
+                        query_message = {
+                            **messages[user_end - 1],
+                            "role": "tool",
+                            "content": merged,
+                            "_tool_user_followup": True,
+                        }
+                        i = user_end - 1
+                messages[i_start : i + 1] = [query_message]
                 i = i_start + 1
-            elif pre_role == "assistant" and role == "assistant" or pre_role == "user" and role == "user":
-                # Consecutive messages from the assistant/user role need to be merged to prevent errors.
+            elif pre_role == "tool" and role == "user" and not self.use_chat_template:
+                raise ValueError(
+                    "A user turn after a tool result requires use_chat_template=True: the non-chat "
+                    "encoder keeps only the last round and would silently drop the tool context. "
+                    "Enable use_chat_template or use a single-round sample."
+                )
+            elif pre_role == "assistant" and role == "assistant":
+                # Consecutive assistant messages belong to one response; merge them into one turn.
                 if self.template_backend == "swift" and pre_role == "assistant":
                     for key in ["content", "loss", "loss_scale"]:
                         pre_val = pre_message.get(key)
@@ -1878,7 +2085,7 @@ class Template(ProcessorMixin):
     def _swift_encode(self, inputs: StdTemplateInputs):
         template_meta = self.template_meta
         if self.use_chat_template:
-            if self.add_non_thinking_prefix:
+            if self.add_non_thinking_prefix and self.template_meta.train_final_think_block is not None:
                 self._add_non_thinking_prefix(inputs)
             preserve_thinking = self._get_preserve_thinking(inputs)
             if not preserve_thinking:
@@ -1910,34 +2117,77 @@ class Template(ProcessorMixin):
         self._concat_context_list(prefix, res_context_list, res_context_types, system=system)
 
         assert len(inputs.messages) > 0, f"inputs.messages: {inputs.messages}"
-        n_round = len(inputs.messages) // 2
-        for i, (query_message, response_message) in enumerate(zip(inputs.messages[::2], inputs.messages[1::2])):
-            query_role, query = query_message["role"], query_message["content"]
-            response_role, response = response_message["role"], response_message["content"]
-            # TODO: Optimize the Template mechanism.
-            assert query_role in {"user", "tool"}, f'query_role: "{query_role}"'
-            assert response_role in {"assistant"}, f'response_role: "{response_role}"'
-            if query_role == "tool":
-                prompt = query
-                query = ""
-            elif template_meta.is_post_system and i == n_round - 1:
-                prompt = template_meta.system_prompt
-            else:
-                prompt = template_meta.prompt
+        # A round is a maximal run of user/tool messages (the round's queries) followed by one
+        # assistant message (the round's response) -- the shape the official jinja renders: every
+        # query message its own turn block, the opener once, right before the response. A
+        # trailing run of queries with no response is the inference generation prompt.
+        rounds = split_rounds(inputs.messages)
 
-            context_list = prompt.copy()
+        response_prefix = self._get_response_prefix(inputs)
+        for round_idx, (query_messages, response_message) in enumerate(rounds):
+            last_round = round_idx == len(rounds) - 1
+            # Each query message renders its own block, in message order. The opener is not part
+            # of a query block: it is emitted once per round, right before the response, so a
+            # round may hold several query messages (consecutive users, or a tool response
+            # followed by a user message) the way the official jinja renders them.
+            for query_message in query_messages:
+                query_role, query = query_message["role"], query_message["content"]
+                if query_role == "tool":
+                    # the agent template pre-rendered this block (separator and query text in place),
+                    # so it is payload: no slot substitution runs over it, or a literal '{{QUERY}}'
+                    # or '{{ROUND0}}' inside a tool result or follow-up would be rewritten here.
+                    context_list = query.copy() if isinstance(query, list) else [query]
+                    block_slots = dict(system=None, query=None, round0=None)
+                elif template_meta.is_post_system and system is not None and last_round and response_message is None:
+                    # post-system families render the system block on the trailing generation prompt
+                    # only, never on the rounds that carry a response (Mistral-Nemo)
+                    context_list = template_meta.system_prompt.copy()
+                    block_slots = dict(system=system, query=query, round0=round_idx)
+                else:
+                    context_list = template_meta.prompt.copy()
+                    block_slots = dict(system=system, query=query, round0=round_idx)
+                self._concat_context_list(
+                    context_list,
+                    res_context_list,
+                    res_context_types,
+                    **block_slots,
+                )
+            # An assistant turn continuing after tool outputs opens with the tool block's own
+            # closing markers in some families (DeepSeek V3.1): no turn opener there. A tool block
+            # that already carries trailing user content is not that case -- the official jinja
+            # resets its `is_tool` flag on the user message and re-opens the turn.
+            opener_suppressed = template_meta.suppress_opener_after_tool and query_messages and all(
+                query_message["role"] == "tool" and not query_message.get("_tool_user_followup")
+                for query_message in query_messages
+            )
+            if template_meta.response_opener and not opener_suppressed:
+                opener = template_meta.response_opener.copy()
+                if response_message is None and template_meta.generation_opener is not None:
+                    # the jinja ends the prompt with a different opener than the one it puts
+                    # before a response
+                    opener = template_meta.generation_opener.copy()
+                elif response_message is None and not template_meta.opener_on_generation_prompt:
+                    opener = []
+                elif response_message is None and template_meta.strip_opener_whitespace:
+                    # generation prompt: drop the single trailing whitespace character the opener keeps
+                    # before a response (GLM drops a newline, LLaVA-HF a space, LLaVA-NeXT one of two
+                    # newlines) -- only one, the rest belongs to the prompt
+                    opener = [
+                        item[:-1] if isinstance(item, str) and item[-1:].isspace() else item for item in opener
+                    ]
+                self._concat_context_list(opener, res_context_list, res_context_types)
+            response = None if response_message is None else response_message["content"]
+            context_list = []
             extra_context_list = []
             extra_context_type = None
-            response_prefix = self._get_response_prefix(inputs)
-            if i < n_round - 1:
-                # Not the last round.
-                context_list.append("{{RESPONSE}}")
-                if inputs.messages[2 * (i + 1)]["role"] != "tool":
-                    extra_context_list = template_meta.chat_sep
-                    extra_context_type = ContextType.OTHER
+            if response is not None and not last_round:
+                # Not the last round: separate this response from the next turn.
+                context_list = ["{{RESPONSE}}"]
+                extra_context_list = template_meta.chat_sep
+                extra_context_type = ContextType.OTHER
             elif response is not None:
                 # It is the final round, and the response exists (during training).
-                context_list.append("{{RESPONSE}}")
+                context_list = ["{{RESPONSE}}"]
                 # The GLM-4.5 assistant part (tool call) may end with <|observation|>,
                 # and here we avoid adding <|user|>.
                 response_content = response
@@ -1972,24 +2222,33 @@ class Template(ProcessorMixin):
                     extra_context_type = ContextType.SUFFIX
             elif response_prefix:
                 # final round and during inference.
-                context_list.append(response_prefix)
+                context_list = [response_prefix]
 
-            self._concat_context_list(
-                context_list,
-                res_context_list,
-                res_context_types,
-                query=query,
-                response=response,
-                system=system,
-                round0=i,
-            )
+            if context_list:
+                self._concat_context_list(
+                    context_list,
+                    res_context_list,
+                    res_context_types,
+                    response=response,
+                    system=system,
+                    round0=round_idx,
+                )
             res_context_list += extra_context_list
             res_context_types += [extra_context_type] * len(extra_context_list)
         if template_meta.auto_add_bos and sep_token:
             res_context_list.append(sep_token)
             res_context_types.append(ContextType.SUFFIX)
+        # Loss-scale strategies index messages as strict query/response pairs; rebuild that
+        # pairing from the rounds so a round holding several query messages still maps to one
+        # response, with the round's whole query run as its query.
+        paired_messages = []
+        for query_messages, response_message in rounds:
+            paired_messages.append(merge_query_messages(query_messages))
+            paired_messages.append(
+                response_message if response_message is not None else {"role": "assistant", "content": None}
+            )
         res_context_list, loss_scale_list = self.loss_scale(
-            res_context_list, res_context_types, inputs.messages, **inputs.extra_kwargs
+            res_context_list, res_context_types, paired_messages, **inputs.extra_kwargs
         )
         if self.is_training:
             answer_len = len(extra_context_list) + bool(response is not None)
@@ -2102,7 +2361,7 @@ class Template(ProcessorMixin):
                 raise ValueError(f"Invalid truncation_strategy: {self.truncation_strategy}")
         encoded["length"] = length
         encoded["input_ids"] = input_ids
-        if self.task_type in {"seq_cls", "embedding", "reranker", "generative_reranker"}:
+        if self.task_type in {"seq_cls", "embedding", "reranker", "generative_reranker", "decision"}:
             encoded.pop("labels", None)
             encoded.pop("loss_scale", None)
         else:
@@ -2309,6 +2568,8 @@ class Template(ProcessorMixin):
             res = self._embedding_data_collator(batch, padding_to=padding_to)
         elif self.task_type in {"reranker", "generative_reranker"}:
             res = self._reranker_data_collator(batch, padding_to=padding_to)
+        elif self.task_type == "decision":
+            res = self._decision_data_collator(batch, padding_to=padding_to)
         else:
             raise ValueError(f"task_type: {self.task_type} is not supported.")
         if not self.remove_unused_columns:
@@ -2481,6 +2742,78 @@ class Template(ProcessorMixin):
                 labels = torch.tensor(labels, dtype=torch.long)
             res["labels"] = labels
         return res
+
+    def _decision_data_collator(
+        self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Legacy HF-side collator for the decision task type (export tools / raw HF batches).
+
+        The dev training path batches the same flattening through the family's media hooks
+        (``pop_media`` -> ``collate_media`` -> ``finalize_batch``, see
+        ``template/families/decision.py``); this method keeps the pre-dev contract alive for callers
+        that hand plain encoded rows straight to ``data_collator``.
+        """
+        record_metas = [b.pop("decision_meta", None) for b in batch]
+        record_targets = [b.pop("target_probs", None) for b in batch]
+        res = self._data_collator(batch, padding_to=padding_to)
+
+        # -- flatten per-record decision_meta into batched flat lists (len == total_q) --
+        flat: Dict[str, Any] = {
+            "record_index": [],
+            "n_options": [],
+            "kinds": [],
+            "question_spans": [],
+            "option_spans": [],
+            "counts": [],
+        }
+        max_opt = 0
+        for rec_i, meta in enumerate(record_metas):
+            self._extract_extra_decision_meta(meta, rec_i, flat)
+            if meta is None:
+                continue
+            n_options = [int(n) for n in (meta.get("n_options") or [])]
+            nq = len(n_options)
+            flat["counts"].append(nq)
+            flat["record_index"].extend([rec_i] * nq)
+            flat["n_options"].extend(n_options)
+            flat["kinds"].extend(meta.get("kinds") or [])
+            flat["question_spans"].extend(meta.get("question_spans") or [])
+            flat["option_spans"].extend(meta.get("option_spans") or [])
+            if nq:
+                max_opt = max(max_opt, max(n_options))
+        flat["max_opt"] = max_opt
+
+        padding_side = self.padding_side if self.is_training else "left"
+        flat["left_padding"] = padding_side == "left"
+        attention_mask = res.get("attention_mask")
+        if isinstance(attention_mask, torch.Tensor):
+            flat["seq_lens"] = attention_mask.sum(dim=-1).tolist()
+        else:
+            flat["seq_lens"] = None
+        res["decision_meta"] = flat
+
+        # -- flatten + pad target_probs into [total_q, max_opt] labels tensor --
+        if not all(t is None for t in record_targets) and max_opt > 0:
+            rows: List[List[float]] = []
+            for targets in record_targets:
+                if targets is None:
+                    continue
+                for q in targets:
+                    row = [0.0] * max_opt
+                    n = min(len(q), max_opt)
+                    row[:n] = [float(x) for x in q[:n]]
+                    rows.append(row)
+            if rows:
+                res["labels"] = torch.tensor(rows, dtype=torch.float32)
+
+        return res
+
+    def _extract_extra_decision_meta(self, meta: Optional[Dict[str, Any]], rec_i: int, flat: Dict[str, Any]) -> None:
+        """Hook for template-specific decision meta fields. The base implementation is a no-op;
+        subclasses (e.g. OmniJevTemplate) override this to flatten model-specific fields like
+        ``option_markers`` or ``mm_counts`` into ``flat`` without polluting the shared collator.
+        """
+        return
 
     def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
         """

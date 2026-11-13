@@ -30,7 +30,8 @@ class MinicpmTemplateMeta(TemplateMeta):
     suffix: Prompt = field(default_factory=lambda: ["</s>"])
 
 
-register_template(MinicpmTemplateMeta(LLMTemplateType.minicpm))
+# The official chat template emits no bos/eos around the render.
+register_template(MinicpmTemplateMeta(LLMTemplateType.minicpm, prefix=["{{SYSTEM}}"], suffix=[]))
 
 
 def _remove_idx(arr: List[int], idx_list: List[int]) -> List[int]:
@@ -718,6 +719,9 @@ register_template(
 register_template(
     ChatmlTemplateMeta(
         LLMTemplateType.minicpm5,
+        # the official jinja opens with a bos token before the first turn
+        prefix=["<s>"],
+        system_prefix=["<s><|im_start|>system\n{{SYSTEM}}<|im_end|>\n"],
         is_thinking=True,
         thinking_prefix="<think>\n",
         non_thinking_prefix="<think>\n\n</think>\n\n",

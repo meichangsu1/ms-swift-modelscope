@@ -17,7 +17,7 @@ from transformers import AutoConfig, AutoProcessor, AutoTokenizer, PretrainedCon
 from swift.dev.utils import get_logger
 from swift.dev.utils.tags import validate_tags
 
-logger = get_logger(__name__)
+logger = get_logger()
 
 #: Families already warned about trust_remote_code this process: the warning states a
 #: per-family fact, so once per family is the right cadence -- not once per checkpoint.
@@ -27,7 +27,6 @@ __all__ = [
     "ModelArch",
     "LoaderModelInfo",
     "ModelLoader",
-    "MODEL_ALIASES",
     "MODEL_MAPPING",
     "get_model_loader",
     "match_model_type",
@@ -45,9 +44,6 @@ _PART_FIELDS = ("language_model", "vision_tower", "aligner", "generator")
 _LIST_FIELDS = _PART_FIELDS + ("moe_block",)
 
 MODEL_MAPPING: Dict[str, Type["ModelLoader"]] = {}
-# Alias -> registered model_type. Keeps `--model_type ovis_ocr2` and old `args.json` working after
-# two legacy model_types that differed only by template were merged into one family.
-MODEL_ALIASES: Dict[str, str] = {}
 # HuggingFace class name -> model_types, lazily built and invalidated on every registration.
 _ARCH_MAPPING: Dict[str, List[str]] = {}
 
@@ -236,8 +232,23 @@ class LoaderModelInfo:
 
 
 def _basename(model_id: str) -> str:
-    """The trailing path component, lower-cased -- how ids and local dirs are compared."""
-    return model_id.rstrip("/").rsplit("/", 1)[-1].lower()
+    """The trailing path component, lower-cased -- how ids and local dirs are compared.
+
+    A hub cache buries the real name inside ``.../models--org--name/snapshots/<sha>``, so a plain
+    ``rsplit`` would return the commit sha and the id match would fall through to the
+    architecture reverse-lookup -- which is ambiguous whenever a task variant (e.g. qwen2_gte)
+    declares the same architecture. Mirror DatasetLoader.dataset_name's cache-path handling.
+    """
+    model_id = model_id.rstrip('/')
+    # ModelScope lays the cache out as ``.../models/org--name/snapshots/<sha>``; HuggingFace as
+    # ``.../models--org--name/snapshots/<sha>``. Both bury the name, and the ``org--`` part is
+    # optional on either side.
+    match = re.search(r'/(?:models--(?:.+?--)?|models/(?:.+?--)?)(.+?)/snapshots/', model_id)
+    if match is not None:
+        return match.group(1).lower()
+    if platform.system().lower() == 'windows':
+        model_id = model_id.replace('\\', '/')
+    return model_id.rsplit('/', 1)[-1].lower()
 
 
 def _iter_ids(models: Sequence[Union[str, Tuple[str, str]]]) -> Iterator[Tuple[str, str]]:
@@ -263,15 +274,12 @@ def register_model(loader_cls: Type["ModelLoader"] = None, *, exist_ok: bool = F
     def _register(cls: Type["ModelLoader"]) -> Type["ModelLoader"]:
         model_type = cls.model_type
         assert model_type, f"{cls.__name__} must set `model_type`."
+        validate_tags(cls.tags, context=f"model_type `{model_type}`")
         if not exist_ok and model_type in MODEL_MAPPING:
             raise ValueError(
                 f"model_type `{model_type}` is already registered by {MODEL_MAPPING[model_type].__name__}."
             )
         MODEL_MAPPING[model_type] = cls
-        for alias in cls.aliases:
-            if not exist_ok and alias in MODEL_ALIASES and MODEL_ALIASES[alias] != model_type:
-                raise ValueError(f"alias `{alias}` already points at `{MODEL_ALIASES[alias]}`.")
-            MODEL_ALIASES[alias] = model_type
         _ARCH_MAPPING.clear()  # invalidate the reverse-lookup cache
         return cls
 
@@ -279,8 +287,7 @@ def register_model(loader_cls: Type["ModelLoader"] = None, *, exist_ok: bool = F
 
 
 def get_model_loader(model_type: str) -> Type["ModelLoader"]:
-    """Look up a family, following aliases."""
-    model_type = MODEL_ALIASES.get(model_type, model_type)
+    """Look up a family."""
     if model_type not in MODEL_MAPPING:
         raise ValueError(f"model_type `{model_type}` is not registered. Available: {sorted(MODEL_MAPPING)}")
     return MODEL_MAPPING[model_type]
@@ -341,7 +348,7 @@ def resolve_loader_cls(model_type: Optional[str], model_id: str) -> Optional[Typ
     from swift.dev.utils.naming import resolve_plugin_class
 
     if model_type:
-        if model_type in MODEL_MAPPING or model_type in MODEL_ALIASES:
+        if model_type in MODEL_MAPPING:
             return get_model_loader(model_type)
         return resolve_plugin_class(model_type, ModelLoader, MODEL_MAPPING, kind="model")
     matched = match_model_type(model_id)
@@ -454,10 +461,12 @@ def resolve_model_info(
         download_model=download_model,
         ignore_patterns=getattr(loader_cls, "ignore_patterns", None),
     )
-    try:
-        config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    except Exception:  # noqa: BLE001 -- a remote-code config that only ships a dict still matches
-        config = PretrainedConfig.get_config_dict(model_dir)[0]
+    config = HfConfigFactory.load_hf_config(model_dir, trust_remote_code=True, revision=revision)
+    if config is None:
+        try:
+            config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True, revision=revision)
+        except Exception:  # noqa: BLE001 -- a remote-code config that only ships a dict still matches
+            config = PretrainedConfig.get_config_dict(model_dir, revision=revision)[0]
 
     if loader_cls is None and model_type is None:
         # No family matched the name. The checkpoint's own args.json comes before the (ambiguous)
@@ -611,7 +620,6 @@ class ModelLoader:
     models: Sequence[Union[str, Tuple[str, str]]] = ()
     architectures: Sequence[str] = ()
     template: Optional[str] = None
-    aliases: Sequence[str] = ()
     requires: Sequence[str] = ()
     tags: Sequence[str] = ()
     # Glob patterns of files to skip at download. ``None`` lets the download layer apply its default
@@ -698,8 +706,17 @@ class ModelLoader:
 
     def build_config(self, model_dir: str, **kwargs) -> PretrainedConfig:
         self._apply_trust_remote_code(kwargs)
-        config_cls = _import_cls(self.config_cls) if self.config_cls else AutoConfig
-        return config_cls.from_pretrained(model_dir, **kwargs)
+        if self.config_cls:
+            return _import_cls(self.config_cls).from_pretrained(model_dir, **kwargs)
+        from swift.dev.utils import HfConfigFactory
+
+        config = HfConfigFactory.load_hf_config(
+            model_dir,
+            trust_remote_code=kwargs.get('trust_remote_code', False),
+            revision=kwargs.get('revision'))
+        if config is not None:
+            return config
+        return AutoConfig.from_pretrained(model_dir, **kwargs)
 
     def build_processor(self, model_dir: str, config: PretrainedConfig, **kwargs):
         self._apply_trust_remote_code(kwargs)

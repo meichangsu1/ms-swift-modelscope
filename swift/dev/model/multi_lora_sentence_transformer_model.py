@@ -12,7 +12,6 @@ from transformers import PretrainedConfig, PreTrainedModel
 
 from twinkle import DeviceMesh, Platform, remote_class, remote_function
 from twinkle.hub import HubOperation
-from twinkle.infra import get_device_mesh
 from twinkle.model.base import ModelLoaderProtocol, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.multi_lora import MultiLora
 from twinkle.model.transformers.multi_lora_transformers import MultiLoraTransformersModel
@@ -60,9 +59,8 @@ class MultiLoraSentenceTransformerModel(MultiLoraTransformersModel, SentenceTran
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
         self._default_tokenizer = None
-        # Overrides the @remote_class-wrapped base, so no automatic device_mesh injection; resolve
-        # the global default to uphold the "a constructed model holds a real mesh" invariant.
-        self.device_mesh = device_mesh if device_mesh is not None else get_device_mesh()
+        # @remote_class injects the global default mesh when the caller passes none.
+        self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
@@ -84,8 +82,17 @@ class MultiLoraSentenceTransformerModel(MultiLoraTransformersModel, SentenceTran
             model_id = HubOperation.download_model(model_id)
         self.model_id = model_id
         # The ST pipeline owns construction, so ``model_loader.build_model`` is skipped; its config and
-        # processor hooks stay wired the same way MultiLoraTransformersModel uses them.
-        self.model = self._build_sentence_transformer(model_id, sentence_transformer_kwargs or {})
+        # processor hooks stay wired the same way MultiLoraTransformersModel uses them. The loader is also
+        # the authority on ``trust_remote_code`` for building the backbone: a family whose checkpoint ships
+        # stale remote code the installed transformers cannot load (e.g. gte-Qwen2's 4.41-era
+        # ``modeling_qwen.py`` reading ``config.rope_theta``, which transformers 5.x migrated into
+        # ``rope_parameters`` and dropped) declares ``trust_remote_code=False`` so ``SentenceTransformer``
+        # builds from the native class. ``_build_sentence_transformer`` only defaults it to True when
+        # neither the caller nor a loader pinned it.
+        st_kwargs = dict(sentence_transformer_kwargs or {})
+        if model_loader is not None:
+            st_kwargs.setdefault('trust_remote_code', getattr(model_loader, 'trust_remote_code', True))
+        self.model = self._build_sentence_transformer(model_id, st_kwargs)
         if config is not None:
             self.hf_config = config
         elif model_loader is not None and model_id is not None:

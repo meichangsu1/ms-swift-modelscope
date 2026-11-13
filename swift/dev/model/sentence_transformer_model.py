@@ -3,10 +3,9 @@ import os
 from typing import Any, Dict, List, Optional, Union
 
 from transformers import PreTrainedModel
-from twinkle import Platform, remote_function
+from twinkle import DeviceMesh, Platform, remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.infra import collect_tensor_dict, get_device_mesh
 from twinkle.model.transformers.transformers import TransformersModel as TwinkleTransformersModel
 from twinkle.model.transformers.transformers import _default_adapter_name
 from twinkle.processor import InputProcessor
@@ -19,6 +18,7 @@ logger = get_logger()
 _ST_FEATURE_KEYS = ("input_ids", "attention_mask", "token_type_ids", "position_ids")
 
 
+@remote_class()
 class SentenceTransformerModel(TwinkleTransformersModel):
     """Train a ``sentence-transformers`` model on twinkle's embedding pipeline.
 
@@ -50,14 +50,17 @@ class SentenceTransformerModel(TwinkleTransformersModel):
         model_id: Optional[str] = None,
         *,
         config: Any = None,
-        device_mesh: Any = None,
+        device_mesh: Optional[DeviceMesh] = None,
         mixed_precision: str = "bf16",
         strategy: str = "accelerate",
         ddp_config: Optional[Dict[str, Any]] = None,
         fsdp_config: Optional[Dict[str, Any]] = None,
         grad_scaler_config: Optional[Dict[str, Any]] = None,
         memory_efficient_init: bool = False,
+        model_arch: Optional[Dict[str, Any]] = None,
         sentence_transformer_kwargs: Optional[Dict[str, Any]] = None,
+        gradient_checkpointing: bool = True,
+        gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         # Mirror TwinkleTransformersModel.__init__ plumbing, but build a SentenceTransformer instead of
@@ -67,10 +70,8 @@ class SentenceTransformerModel(TwinkleTransformersModel):
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
         self._default_tokenizer = None
-        # This __init__ overrides the @remote_class-wrapped base, so it does NOT receive the base's
-        # automatic device_mesh injection; resolve the global default here to uphold the same invariant
-        # (a constructed model holds a real mesh) the wrapped TransformersModel.__init__ guarantees.
-        self.device_mesh = device_mesh if device_mesh is not None else get_device_mesh()
+        # @remote_class injects the global default mesh when the caller passes none.
+        self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
@@ -78,6 +79,13 @@ class SentenceTransformerModel(TwinkleTransformersModel):
         # The inherited _construct_default_optimizer_group reads this (same contract as the parent's
         # ctor arg); a sentence encoder accumulates per token like any causal-LM-shaped model.
         self._acc_strategy = kwargs.pop("acc_strategy", "token")
+        # This __init__ mirrors the parent's plumbing but skips its __init__, so model_arch must be set
+        # here too: _patch_frozen_towers reads self.model_arch on every add_adapter_to_model, and the
+        # all-linear narrowing reads its language_model role. Same role normalization as the parent.
+        self.model_arch = dict(model_arch or {})
+        for _role in ('language_model', 'vision_tower', 'aligner'):
+            _value = self.model_arch.get(_role)
+            self.model_arch[_role] = [_value] if isinstance(_value, str) else list(_value or [])
         # Router replay is a MoE-causal-LM concept; irrelevant to sentence encoders.
         self._router_replay_enabled = False
         self._router_replay_applied = False
@@ -91,7 +99,11 @@ class SentenceTransformerModel(TwinkleTransformersModel):
         self.model = self._build_sentence_transformer(model_id, sentence_transformer_kwargs or {})
         # hf_config is read by the processor/loss for e.g. pad-token / dtype; expose the backbone's.
         self.hf_config = getattr(config, "name_or_path", None) and config or self._backbone_config()
-        self._enable_gradient_checkpointing()
+        # The builder threads --gradient_checkpointing straight here; the old unconditional enable
+        # made "false" a silently dead flag on this path (the flag fell into **kwargs) while the
+        # multi-tenant subclass's positional call crashed against a no-arg method.
+        if gradient_checkpointing:
+            self._enable_gradient_checkpointing(gradient_checkpointing_kwargs)
 
         self.sp_strategy = None
         self._model_wrapped = False
@@ -125,11 +137,13 @@ class SentenceTransformerModel(TwinkleTransformersModel):
         auto_model = getattr(self._first_module(), "auto_model", None)
         return getattr(auto_model, "config", None)
 
-    def _enable_gradient_checkpointing(self):
+    def _enable_gradient_checkpointing(self, gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None):
         # SentenceTransformer has no top-level gradient_checkpointing_enable; drive the backbone.
+        # Accepts the kwargs the multi-tenant subclass passes positionally, and forwards them the
+        # way TransformersModel does (e.g. use_reentrant).
         auto_model = getattr(self._first_module(), "auto_model", None)
         if auto_model is not None and hasattr(auto_model, "gradient_checkpointing_enable"):
-            auto_model.gradient_checkpointing_enable()
+            auto_model.gradient_checkpointing_enable(**(gradient_checkpointing_kwargs or {}))
 
     def gradient_checkpointing_disable(self):
         """Symmetric with :meth:`_enable_gradient_checkpointing` -- a ``SentenceTransformer`` has no
@@ -215,7 +229,7 @@ class SentenceTransformerModel(TwinkleTransformersModel):
         optimizer_config.train_status.loss_value = outputs.get("aux_loss", 0)
         return {"embeddings": embeddings}
 
-    @remote_function(dispatch="slice_dp", collect=collect_tensor_dict)
+    @remote_function(dispatch="slice_dp", collect='tensor_dict')
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         import torch
 

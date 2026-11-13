@@ -140,6 +140,9 @@ class LLMTemplateType:
     olmoe = "olmoe"
     olmoe_0924 = "olmoe_0924"
 
+    generic_decision = "generic_decision"
+    laya = "laya"
+
 
 class RMTemplateType:
     internlm2_reward = "internlm2_reward"
@@ -156,6 +159,7 @@ class MLLMTemplateType:
     qwen3_asr = "qwen3_asr"
     qwen3_tts = "qwen3_tts"
     qwen3_vl = "qwen3_vl"
+    qwen3_vl_thinking = "qwen3_vl_thinking"
     qwen3_vl_emb = "qwen3_vl_emb"
     qwen3_vl_reranker = "qwen3_vl_reranker"
     qwen3_5 = "qwen3_5"
@@ -284,6 +288,13 @@ class MLLMTemplateType:
     hunyuan_ocr = "hunyuan_ocr"
     step3_vl = "step3_vl"
     minimax_m3_vl = "minimax_m3_vl"
+
+    jev = "jev"
+    clef = "clef"
+    omnijev = "omnijev"
+    kev = "kev"
+    thx02 = "thx02"
+    startlux = "startlux"
 
 
 class TemplateType(LLMTemplateType, MLLMTemplateType, RMTemplateType):

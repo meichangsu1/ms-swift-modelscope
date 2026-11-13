@@ -37,7 +37,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ALL_COMPLETED, Future, ThreadPoolExecutor, wait
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from .graph import FrameSpec, Graph
 
@@ -74,9 +74,23 @@ def _collect_refs(value: Any, depth: int = 0) -> List[Any]:
     elif isinstance(value, (list, tuple)):
         for item in value:
             refs.extend(_collect_refs(item, depth + 1))
-    elif callable(value) and getattr(value, '_is_lazy_collect', False):
+    elif hasattr(value, 'result') and hasattr(value, 'done'):
         refs.append(value)
     return refs
+
+
+def _stage_note(outputs: Any) -> Optional[str]:
+    """A stage that no-op'd this circle marks its receipt ``{'state': 'skipped',
+    'reason': ...}``; surface it on the node event so the stream distinguishes a
+    real firing from a skip -- a cadence-gated weight_sync / checkpoint still
+    'completes' every circle, but only publishes / saves on the cadence."""
+    if not isinstance(outputs, dict):
+        return None
+    for value in outputs.values():
+        if isinstance(value, dict) and value.get('state') == 'skipped':
+            reason = value.get('reason')
+            return f'skipped:{reason}' if reason else 'skipped'
+    return None
 
 
 class SourceHandle:
@@ -305,7 +319,9 @@ class DAGController:
         participation = set().union(*(
             self.graph.upstream_presence(node_id) for frame in self.graph.frames
             for node_id in frame.members))
-        self._emit_plan(participation)
+        self._emit_plan(
+            participation,
+            feedback=[edge_id for frame in self.graph.frames for edge_id in frame.feedback])
         rounds = 0
         completed = 0
         stalled: Dict[str, int] = {}
@@ -398,7 +414,7 @@ class DAGController:
             # but must exist -- started and projected -- before members build.
             participation = set().union(*(self.graph.upstream_presence(node_id)
                                           for node_id in frame.members))
-            self._emit_plan(participation)
+            self._emit_plan(participation, feedback=frame.feedback)
             self._prepare_round(participation)
             handle = self._source(source_id)
             if self._freshen_producers(frame, observe=observe):
@@ -586,8 +602,16 @@ class DAGController:
                         self._mark_running(node_id, running=False)
                         error = future.exception()
                         if error is not None:
-                            for other in futures:
+                            # Cancel the un-started rest, then DRAIN: cancel() cannot stop a future
+                            # already executing, and the nodes they map to were marked running at
+                            # submit time. Leaving them in _running here made a failed run report
+                            # ghost "running" nodes to get_running_nodes() forever after.
+                            remaining = list(futures)
+                            for other in remaining:
                                 other.cancel()
+                            wait(remaining, return_when=ALL_COMPLETED)
+                            for other in remaining:
+                                self._mark_running(futures.pop(other), running=False)
                             raise error
                         with self._lock:
                             self._outputs[node_id] = future.result()
@@ -651,7 +675,9 @@ class DAGController:
         except Exception as exc:
             self._event('node', node_id=node_id, state='failed', error=str(exc))
             raise
-        self._event('node', node_id=node_id, state='completed')
+        note = _stage_note(outputs)
+        self._event('node', node_id=node_id, state='completed',
+                    **({'note': note} if note else {}))
         return outputs
 
     def _invoke_task(self, node_id: str, component: Any,
@@ -669,14 +695,14 @@ class DAGController:
     def _await_stage_outputs(node_id: str, outputs: Any) -> None:
         """Hold 'running' until the stage's reference outputs are truly done.
 
-        Remote-execution stages return LazyCollect handles; a handle is
-        completion-probed with the public ``ready()`` (a non-materialising
-        ray.wait(timeout=0)) so 'completed' always means the computation
+        Remote-execution stages return pending handles; a handle is
+        completion-probed with the Future-protocol ``done()`` (non-materialising)
+        so 'completed' always means the computation
         finished -- never merely that the call was submitted. A FAILED task
-        also reports ready: the exception surfaces at the consuming collect,
+        also reports done: the exception surfaces at the consuming collect,
         exactly like the kernel's own handle semantics."""
         refs = _collect_refs(outputs)
-        while refs and not all(ref.ready() for ref in refs):
+        while refs and not all(ref.done() for ref in refs):
             time.sleep(0.05)
 
     # -- inputs and projections ------------------------------------------------
@@ -880,8 +906,13 @@ class DAGController:
                 total += node_out['optimizer_steps']
         return total
 
-    def _emit_plan(self, participation: Set[str]) -> None:
-        """本次参与范围不等于节点正在执行；下游无需先转动才能显示上游出线。"""
+    def _emit_plan(self, participation: Set[str], feedback: Sequence[str] = ()) -> None:
+        """本次参与范围不等于节点正在执行；下游无需先转动才能显示上游出线。
+
+        ``feedback`` 是本环的回环 CTRL 边 id。``inputs_of`` 有意跳过回环边
+        （它不投影为任何节点的入参），上面的遍历永远收不到它；不显式
+        补进计划边集合，前端 activeEdges 就不含回环线，它被永久压暗，
+        尽管环真的在转。"""
         edge_ids = []
         for node_id in self.graph.order:
             if node_id not in participation:
@@ -890,6 +921,7 @@ class DAGController:
                 for edge in source if isinstance(source, list) else [source]:
                     if edge.source in participation:
                         edge_ids.append(edge.id)
+        edge_ids.extend(feedback)
         self._event('run_plan', nodes=[node_id for node_id in self.graph.order
                                        if node_id in participation], edges=edge_ids)
 

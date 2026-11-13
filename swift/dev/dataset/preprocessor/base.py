@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 import os
+import sys
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Union
 
@@ -30,6 +31,10 @@ class Preprocessor:
     format_name: Optional[str] = None
     columns: Dict[str, str] = {}
     converter_kwargs: Dict[str, Any] = {}
+
+    # Run-level augmentation channel this preprocessor consumes, or None when it consumes none.
+    # declaring a channel is the opt-in, so preprocessors without one are never touched.
+    augment_channel: Optional[str] = None
 
     # Columns whose Arrow type must be pinned rather than inferred: inference sees only the rows in
     # hand, so two shards of one dataset can infer types that only fail to align at concatenation.
@@ -111,6 +116,15 @@ class Preprocessor:
         """
         return self.converter.apply_aliases(row)
 
+    def bind_augment(self, config: Any, seed: int) -> None:
+        """Receive this run's augmentation ``config`` for :attr:`augment_channel`.
+
+        Called by the dataset loader only on preprocessors whose ``augment_channel`` names a
+        config the run carried (DatasetConfig-driven, keyed by channel); ``seed`` is the dataset
+        seed, so a fresh per-run RNG derived from it stays identical across ranks and resumes.
+        Override together with ``augment_channel``; the base implementation is a no-op.
+        """
+
     def __call__(
         self,
         dataset,
@@ -130,6 +144,16 @@ class Preprocessor:
         map_kwargs: Dict[str, Any] = {"batched": True}
         if isinstance(dataset, HfDataset):
             map_kwargs["batch_size"] = batch_size if batch_size is not None else 1000
+            # A live pydevd/debugpy session injects itself into every multiprocessing spawn
+            # ('import pydevd; settrace(...)'), and the spawned map workers then fail on the
+            # debugger socket of THIS process (ConnectionRefused under torchrun children) and die,
+            # taking the run's coordination lock (rank 0) with them. The pool never worked under
+            # a debugger anyway -- fall back to the in-process map instead of crashing.
+            if num_proc >= 2 and 'pydevd' in sys.modules:
+                logger.warning(f'pydevd/debugpy is tracing this process; dataset_num_proc={num_proc} is '
+                               'ignored (spawned map workers crash on the debugger socket). Preprocessing '
+                               'runs in-process: slower under a debugger session, same results.')
+                num_proc = 1
             # num_proc <= 1 maps in-process: a one-worker pool is pure spawn overhead, and a spawned
             # worker rebuilds an UNPATCHED ArrowWriter (see _pin_message_columns_for_pool), which
             # fails to serialise mixed-type message content (a tool_call dict beside plain text).
@@ -142,7 +166,8 @@ class Preprocessor:
         else:
             map_kwargs["batch_size"] = batch_size if batch_size is not None else 16
 
-        with self.pin_features(), self.serialised():
+        lock_key = f'dataset_preprocess/{getattr(dataset, "_fingerprint", "unknown")}/{type(self).__name__}'
+        with self.pin_features(), self.serialised(lock_key, sticky=True):
             mapped = dataset.map(
                 self.batched_preprocess,
                 fn_kwargs={"strict": strict},
@@ -265,15 +290,16 @@ class Preprocessor:
         return self.rows_to_batched(new_rows)
 
     @staticmethod
-    def serialised(key: str = "dataset_preprocess"):
+    def serialised(key: str = "dataset_preprocess", sticky: bool = False):
         """Let one rank run the pass and write its cache first, then the rest read it.
 
-        Not ``sticky``: the same key is used once per dataset per run, so each round needs its own
-        ordering. See :meth:`DatasetLoader.serialised` for why this is not ``safe_ddp_context``.
+        ``sticky`` is set by the caller when the key already identifies the result (see the
+        ``__call__`` lock-key comment). See :meth:`DatasetLoader.serialised` for why this is not
+        ``safe_ddp_context``.
         """
         from twinkle.utils import processing_lock
 
-        return processing_lock(key)
+        return processing_lock(key, sticky=sticky)
 
     @staticmethod
     def map_cache_path(dataset) -> str:

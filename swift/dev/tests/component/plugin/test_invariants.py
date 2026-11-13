@@ -37,6 +37,8 @@ _ALSO_CANDIDATES = set()
 #: Consumed, but not through PluginRegistry -- with the consumer named, so the claim is checkable.
 WIRED_ELSEWHERE = {
     ('PluginConfig', 'external_plugins'): 'PluginRegistry.load_configured imports every source it names',
+    ('CheckpointConfig', 'trust_remote_plugins'): 'cli/parser.py::_restore_checkpoint_args gates the '
+    'checkpoint-declared external_plugins import on it, instead of restoring them silently',
     ('TemplateConfig', 'loss_scale'): "builders/template.py passes it to legacy get_template, whose own "
     'loss_scale registry resolves the name',
     ('InferConfig', 'metric'): "run_infer reads infer_config.metric and hands it to compute_metric (a closed "
@@ -159,8 +161,16 @@ def test_no_name_string_is_handed_to_twinkles_loader():
     """
     offenders = []
     for path in dev_sources():
+        rel = path.relative_to(DEV)
+        # builders/remote.py drives a twinkle_client HTTP handle (MultiLoraTransformersModel), whose
+        # setters are name-typed by design: a class cannot cross HTTP, so the server resolves the name
+        # in its own registry (e.g. 'EmbeddingMetric' -> twinkle.metric.EmbeddingMetric). Nothing there
+        # reaches twinkle's local construct_class/load_plugin, which is the misroute this test guards.
+        # The local counterpart (configure_embedding_metric) passes the CLASS object and is still scanned.
+        if rel.as_posix() == 'builders/remote.py':
+            continue
         for lineno, line in enumerate(path.read_text(encoding='utf-8').splitlines(), start=1):
             if _TWINKLE_SETTERS.search(line):
-                offenders.append(f'{path.relative_to(DEV)}:{lineno}: {line.strip()}')
+                offenders.append(f'{rel}:{lineno}: {line.strip()}')
     assert not offenders, ('these call sites hand twinkle a name string; resolve it to a class or instance '
                            'first (PluginRegistry.get / .resolve):\n' + '\n'.join(offenders))

@@ -45,6 +45,14 @@ from .placement import NUMERIC_GROUP, plan_device_groups
 #: Fixed stdout prefix; the frontend splits on it and never parses logs.
 PREFIX = '[workflow] '
 
+#: The curve channel budget: components record their metric / reward history
+#: as a ``history`` list of small point dicts and the UI plots the whole
+#: series, so it keeps the LAST this-many points instead of the generic
+#: opaque-payload list cap (16) -- which would freeze the curve after 16
+#: rounds. Other nested lists (sample token masks, reward matrices) keep the
+#: generic cap; only the ``history`` key is this channel.
+HISTORY_PREVIEW_LIMIT = 512
+
 STATES = ('idle', 'running', 'pausing', 'paused', 'stopping', 'stopped', 'failed',
           'reset_required', 'releasing', 'released')
 
@@ -141,22 +149,31 @@ class GraphSession:
         if cls is None:
             raise ComponentError(f'{node.id}: no component binding for type {node.type!r}')
         component = cls(node.id, {k: v for k, v in node.params.items()})
+        if node.code:
+            # The code blob rides the NODE, not params (the canvas writes it
+            # as an instance field); the code component reads it back here.
+            component.code = node.code
         component.remote_group = self._device_plan.remote_groups.get(node.id, '')
         return component
 
     def _fingerprint(self, node: NodeSpec) -> str:
-        """Construction fingerprint: the node's own params + its upstream
-        resources' fingerprints (a changed upstream IS a changed resident).
+        """Construction fingerprint: the node's own params (and code blob) +
+        its upstream resources' fingerprints (a changed upstream IS a changed
+        resident).
 
         Upstream means wired inputs AND scope-resolved sources: a variable
         the node consumes through connectivity (never through a wire) still
-        invalidates the resident when its defining node changes."""
+        invalidates the resident when its defining node changes. The code
+        blob participates the same way params do -- an edited function body
+        must invalidate the resident, or the session keeps running the OLD
+        code silently."""
         upstream_ids = []
         for source in self._graph.inputs_of(node.id).values():
             for edge in (source if isinstance(source, list) else [source]):
                 upstream_ids.append(edge.source)
         upstream_ids.extend(source_id for source_id, _port in self._graph.scope_of(node.id).values())
         return json.dumps({'params': node.params,
+                           'code': node.code,
                            'upstream': [self._fingerprints.get(src, '') for src in upstream_ids]},
                           sort_keys=True, default=str)
 
@@ -456,10 +473,9 @@ class GraphSession:
 
 
 def _deref(value: Any) -> Any:
-    """Resolve a LazyCollect handle (inlined to keep this module import-light)."""
-    if callable(value) and getattr(value, '_is_lazy_collect', False):
-        return value()
-    return value
+    """Resolve a maybe-lazy remote result to its value."""
+    from swift.dev.utils.scoring import collect
+    return collect(value)
 
 
 def _lane_summary(value: Any) -> Any:
@@ -478,7 +494,17 @@ def _bound(value: Any, depth: int = 0) -> Any:
     if depth > 6:
         return '...'
     if isinstance(value, dict):
-        return {str(k): _bound(v, depth + 1) for k, v in list(value.items())[:32]}
+        bounded: Dict[str, Any] = {}
+        for key, item in list(value.items())[:32]:
+            if str(key) == 'history' and isinstance(item, (list, tuple)):
+                # The curve channel (see HISTORY_PREVIEW_LIMIT): keep the
+                # TAIL so a long run's curve shows the recent window, not a
+                # frozen head.
+                bounded[str(key)] = [_bound(point, depth + 1)
+                                     for point in list(item)[-HISTORY_PREVIEW_LIMIT:]]
+            else:
+                bounded[str(key)] = _bound(item, depth + 1)
+        return bounded
     if isinstance(value, (list, tuple)):
         return [_bound(v, depth + 1) for v in list(value)[:16]]
     if isinstance(value, (int, float, bool)) or value is None:
@@ -505,7 +531,11 @@ def _optional_int(value: Any, name: str) -> Optional[int]:
         result = int(value)
     except (TypeError, ValueError):
         raise GraphValidationError(f'{name}: 需要整数，得到 {value!r}') from None
-    return result if result >= 0 else None
+    if result < 0:
+        # A negative steps used to fall through as None = run unbounded: a typo the user cannot
+        # see, since the run just never stops. Reject it the same way a non-integer is rejected.
+        raise GraphValidationError(f'{name}: 需要非负整数，得到 {value!r}')
+    return result
 
 
 def _bootstrap(declaration: Dict[str, Any]) -> None:
@@ -513,7 +543,7 @@ def _bootstrap(declaration: Dict[str, Any]) -> None:
 
     Local: the resource page's cards become the process's visible GPUs (ray
     maps its slots onto them). Cluster: attach to the given address; groups
-    are numbered over the announced GPU count. The numeric worker's CPU
+    are numbered over the announced GPU count. The numeric components' CPU
     group rides along -- every group must exist here because twinkle only
     declares groups at init time.
     """
@@ -525,27 +555,16 @@ def _bootstrap(declaration: Dict[str, Any]) -> None:
     from twinkle import DeviceGroup, Platform
 
     if graph.resource.mode == 'cluster':
-        import ray
         # One namespace PER SESSION PROCESS: actor names are deterministic
         # (remote class + call site), so two concurrent sessions sharing one
         # cluster would collide on the first named actor. The pid keeps the
-        # namespace unique yet traceable in logs. The env var is the control
-        # point twinkle's worker creation actually reads (TWINKLE_RAY_
-        # NAMESPACE); ray.init's namespace is kept aligned for lookups.
-        namespace = f'webui_session_{os.getpid()}'
-        os.environ['TWINKLE_RAY_NAMESPACE'] = namespace
-        init_kwargs: Dict[str, Any] = {
-            'address': graph.resource.cluster_address,
-            'ignore_reinit_error': True,
-            'namespace': namespace,
-        }
-        # The driver's import paths must reach the workers: a dev checkout
-        # (twinkle/src + the repo ride on PYTHONPATH) is not pip-installed on
-        # the cluster nodes, and ray does not propagate PYTHONPATH by itself.
-        pythonpath = os.environ.get('PYTHONPATH', '')
-        if pythonpath:
-            init_kwargs['runtime_env'] = {'env_vars': {'PYTHONPATH': pythonpath}}
-        ray.init(**init_kwargs)
+        # namespace unique yet traceable in logs; twinkle reads it when it
+        # names and looks up actors (TWINKLE_RAY_NAMESPACE). RAY_ADDRESS makes
+        # twinkle.initialize attach to the cluster instead of starting one; the
+        # workers inherit this process's env (PYTHONPATH included), so a dev
+        # checkout that is not pip-installed on the nodes still imports there.
+        os.environ['TWINKLE_RAY_NAMESPACE'] = f'webui_session_{os.getpid()}'
+        os.environ['RAY_ADDRESS'] = graph.resource.cluster_address
     else:
         # Ray's local slots map onto exactly the selected physical cards.
         os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(card) for card in graph.resource.cards)
@@ -600,10 +619,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         except ValueError:
             reply = {'event': 'reply', 'ok': False, 'error': 'malformed command line'}
         else:
-            op = str(cmd.get('op', cmd.get('command', '')))
-            reply = session.command(cmd)
-            reply = {'event': 'reply', 'op': op,
-                     'request_id': str(cmd.get('request_id', '')), **reply}
+            if not isinstance(cmd, dict):
+                # A legal JSON non-object ([] / null / 123 / "str") has no .get; reject it
+                # cleanly instead of an uncaught AttributeError killing the resident session
+                # mid-protocol (the frontend would see stdout EOF, not a diagnostic).
+                reply = {'event': 'reply', 'ok': False,
+                         'error': 'command must be a JSON object'}
+            else:
+                op = str(cmd.get('op', cmd.get('command', '')))
+                try:
+                    result = session.command(cmd)
+                except (GraphValidationError, ComponentError, DAGError) as exc:
+                    # A validation / control error is a clean reply, not a dead session: an
+                    # illegal preview window (GraphValidationError) or a component misuse must
+                    # leave the process driving the next command, so the error rides the reply.
+                    result = {'ok': False, 'error': str(exc)}
+                reply = {'event': 'reply', 'op': op,
+                         'request_id': str(cmd.get('request_id', '')), **result}
         try:
             sys.stdout.write(PREFIX + json.dumps(reply, ensure_ascii=False, default=str) + '\n')
             sys.stdout.flush()
@@ -614,6 +646,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if session.state != 'released':
         session._release()
     session._executor.shutdown(wait=True)
+    # The session always boots ray (_bootstrap). Tear the runtime down explicitly instead of
+    # leaving it to interpreter shutdown, where the CUDA/NCCL C-extension cleanup races the
+    # ray actor teardown and segfaults the driver on exit. _release already released the
+    # resident actors; this stops the local ray runtime so the process exits cleanly.
+    try:
+        import twinkle
+        twinkle.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
     return 0
 
 

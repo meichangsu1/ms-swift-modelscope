@@ -160,9 +160,7 @@ class Internvl2Template(InternvlTemplate):
         return encoded
 
 
-_internvl2_system = (
-    "你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。"
-)
+_internvl2_system = "You are a helpful assistant."
 register_template(
     ChatmlTemplateMeta(
         MLLMTemplateType.internvl2,
@@ -187,14 +185,35 @@ register_template(
     )
 )
 
-register_template(ChatmlTemplateMeta(MLLMTemplateType.internvl3_5, template_cls=Internvl2Template))
+class Internvl3_5Template(Internvl2Template):
+    def _swift_prepare_inputs(self, inputs: StdTemplateInputs):
+        super()._swift_prepare_inputs(inputs)
+        messages = inputs.messages
+        # the jinja marks only assistants after the last user message (its last_query_index)
+        last_query = max((i for i, message in enumerate(messages) if message["role"] == "user"), default=-1)
+        for i, message in enumerate(messages):
+            if message["role"] == "assistant" and i > last_query:
+                content = message.get("content")
+                # only the final response opens with the empty thinking block
+                if isinstance(content, str) and "<think>" not in content:
+                    message["content"] = "<think>\n\n</think>\n\n" + content
+
+
+register_template(ChatmlTemplateMeta(MLLMTemplateType.internvl3_5, template_cls=Internvl3_5Template))
 
 
 class Internvl3_5GPTTemplate(Internvl2Template, GptTemplate):
     pass
 
 
-register_template(GptOssTemplateMeta(MLLMTemplateType.internvl3_5_gpt, template_cls=Internvl3_5GPTTemplate))
+register_template(
+    GptOssTemplateMeta(
+        MLLMTemplateType.internvl3_5_gpt,
+        template_cls=Internvl3_5GPTTemplate,
+        # this jinja closes the developer message right after the instructions
+        developer_trailing_newline=False,
+    )
+)
 
 
 class InternvlhfTemplate(Internvl2Template):

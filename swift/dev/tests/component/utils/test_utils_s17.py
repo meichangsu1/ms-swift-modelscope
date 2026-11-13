@@ -439,6 +439,32 @@ def test_deepspeed_spec_resolution_and_zero_stage(tmp_path):
     assert deepspeed_zero_stage(str(path)) == 1
 
 
+def test_fsdp_spec_resolution_and_guards(tmp_path):
+    """The FSDP spec resolves like the deepspeed one: the bundled preset's fsdp_config section is
+    the base, an explicit --fsdp_config dict merges on top (user beats file), a custom JSON file
+    path is read, off returns None, and a value that is neither preset nor file is REFUSED (it
+    would silently select no configuration at all -- the presence-only no-op this replaces)."""
+    import json as _json
+
+    from swift.dev.utils.utils import resolve_fsdp_config
+
+    preset = resolve_fsdp_config('fsdp2', None)
+    assert preset and preset.get('fsdp_version') == 2 and preset.get('reshard_after_forward') is True
+    merged = resolve_fsdp_config('fsdp2', {'reshard_after_forward': False})
+    assert merged['reshard_after_forward'] is False and merged['fsdp_version'] == 2  # CLI beats file
+    assert resolve_fsdp_config(None, None) is None  # off
+    assert resolve_fsdp_config(None, {'manual_prefetch': True}) == {'manual_prefetch': True}  # no preset
+    path = tmp_path / 'fsdp.json'
+    path.write_text(_json.dumps({'fsdp_config': {'manual_prefetch': True}}))
+    assert resolve_fsdp_config(str(path), None) == {'manual_prefetch': True}
+    with pytest.raises(ValueError, match='names neither an FSDP preset'):
+        resolve_fsdp_config('full_shard', None)  # legacy accelerate-style value: no silent presence-only
+    bad = tmp_path / 'bad.json'
+    bad.write_text('[1, 2]')
+    with pytest.raises(ValueError, match='must be a JSON object'):
+        resolve_fsdp_config(str(bad), None)
+
+
 def test_validate_tags_uses_the_controlled_vocabulary():
     """A controlled tag passes; an unknown spelling is refused naming the offender and the
     registration context -- the whole point is stopping spelling drift at the registration site."""
@@ -478,3 +504,14 @@ def test_naming_tables_agree_with_the_ecosystem_names():
     # the megatron decay-style values stay inside Megatron's legal set
     from swift.dev.utils.naming import _MEGATRON_DECAY_STYLE_MAP
     assert set(_MEGATRON_DECAY_STYLE_MAP.values()) <= {'cosine', 'linear', 'constant', 'inverse-square-root'}
+
+
+def test_score_gather_keeps_disjoint_duplicate_and_reordered_positions():
+    import torch
+
+    from swift.dev.utils.scoring import row_token_scores
+
+    row = torch.arange(8).float()
+    feature = {'labels': [0] * 8}
+    for positions in ([2, 3, 4, 5], [2, 3, 3, 5], [5, 2, 3], [], [1, 3, 7]):
+        assert row_token_scores(row, positions, feature) == row[positions].tolist()

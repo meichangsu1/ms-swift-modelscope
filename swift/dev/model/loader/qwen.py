@@ -38,6 +38,17 @@ class Qwen2VLLoader(ModelLoader):
     requires = ["transformers>=4.45", "qwen_vl_utils>=0.0.6", "decord"]
     tags = ["vision", "video"]
     is_multimodal = True
+
+    @property
+    def model_arch(self) -> ModelArch:
+        # Without this the family reads as a plain LLM: freeze_vit is a no-op and all-linear LoRA adapts
+        # the vision tower too. The merger is the aligner, nested inside the tower.
+        return ModelArch(
+            language_model=["model.language_model", "lm_head"],
+            aligner="model.visual.merger",
+            vision_tower="model.visual",
+        )
+
     models = [
         "Qwen/Qwen2-VL-2B-Instruct",
         "Qwen/Qwen2-VL-7B-Instruct",
@@ -212,21 +223,13 @@ class Qwen3VLLoader(Qwen2VLLoader):
     min_qwen_vl_utils = "0.0.14"
     models = [
         "Qwen/Qwen3-VL-2B-Instruct",
-        "Qwen/Qwen3-VL-2B-Thinking",
         "Qwen/Qwen3-VL-2B-Instruct-FP8",
-        "Qwen/Qwen3-VL-2B-Thinking-FP8",
         "Qwen/Qwen3-VL-4B-Instruct",
-        "Qwen/Qwen3-VL-4B-Thinking",
         "Qwen/Qwen3-VL-4B-Instruct-FP8",
-        "Qwen/Qwen3-VL-4B-Thinking-FP8",
         "Qwen/Qwen3-VL-8B-Instruct",
-        "Qwen/Qwen3-VL-8B-Thinking",
         "Qwen/Qwen3-VL-8B-Instruct-FP8",
-        "Qwen/Qwen3-VL-8B-Thinking-FP8",
         "Qwen/Qwen3-VL-32B-Instruct",
-        "Qwen/Qwen3-VL-32B-Thinking",
         "Qwen/Qwen3-VL-32B-Instruct-FP8",
-        "Qwen/Qwen3-VL-32B-Thinking-FP8",
     ]
 
     def setup_environment(self) -> None:
@@ -247,6 +250,25 @@ class Qwen3VLLoader(Qwen2VLLoader):
 
 
 @register_model
+class Qwen3VLThinkingLoader(Qwen3VLLoader):
+    """Qwen3-VL Thinking; same architecture, its jinja prefills the think opener at the prompt."""
+
+    model_type = "qwen3_vl_thinking"
+    architectures = []
+    template = "qwen3_vl_thinking"
+    models = [
+        "Qwen/Qwen3-VL-2B-Thinking",
+        "Qwen/Qwen3-VL-2B-Thinking-FP8",
+        "Qwen/Qwen3-VL-4B-Thinking",
+        "Qwen/Qwen3-VL-4B-Thinking-FP8",
+        "Qwen/Qwen3-VL-8B-Thinking",
+        "Qwen/Qwen3-VL-8B-Thinking-FP8",
+        "Qwen/Qwen3-VL-32B-Thinking",
+        "Qwen/Qwen3-VL-32B-Thinking-FP8",
+    ]
+
+
+@register_model
 class Qwen3VLMoeLoader(Qwen3VLLoader):
     model_type = "qwen3_vl_moe"
     model_cls = "transformers:Qwen3VLMoeForConditionalGeneration"
@@ -254,12 +276,23 @@ class Qwen3VLMoeLoader(Qwen3VLLoader):
     is_moe = True
     models = [
         "Qwen/Qwen3-VL-30B-A3B-Instruct",
-        "Qwen/Qwen3-VL-30B-A3B-Thinking",
         "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
-        "Qwen/Qwen3-VL-30B-A3B-Thinking-FP8",
         "Qwen/Qwen3-VL-235B-A22B-Instruct",
-        "Qwen/Qwen3-VL-235B-A22B-Thinking",
         "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+    ]
+
+
+@register_model
+class Qwen3VLMoeThinkingLoader(Qwen3VLMoeLoader):
+    """Qwen3-VL-MoE Thinking; its jinja is byte-identical to the dense Thinking one."""
+
+    model_type = "qwen3_vl_moe_thinking"
+    architectures = []
+    template = "qwen3_vl_thinking"
+    models = [
+        "Qwen/Qwen3-VL-30B-A3B-Thinking",
+        "Qwen/Qwen3-VL-30B-A3B-Thinking-FP8",
+        "Qwen/Qwen3-VL-235B-A22B-Thinking",
         "Qwen/Qwen3-VL-235B-A22B-Thinking-FP8",
     ]
 
@@ -928,7 +961,16 @@ class Qwen2GteLoader(Qwen2Loader):
 
     Architecture stays declared (a task variant, like ``Qwen3EmbLoader``, not a template variant): a
     gte checkpoint is always embedding, so reverse-lookup returns qwen2 / qwen2_gte together and the
-    caller disambiguates by id. ``trust_remote_code`` mirrors legacy passing it into SentenceTransformer.
+    caller disambiguates by id.
+
+    ``trust_remote_code`` is False, NOT legacy's True. gte-Qwen2 is a standard ``Qwen2ForCausalLM``
+    arch natively in transformers 5.x, but its bundled ``modeling_qwen.py`` is a stale 4.41-era
+    vendored copy that reads ``config.rope_theta`` -- an attribute transformers 5.x migrated into
+    ``config.rope_parameters`` and dropped, so the remote code crashes at load with ``AttributeError:
+    'Qwen2Config' object has no attribute 'rope_theta'``. The native ``Qwen2Model`` loads the same
+    weights, honors the migrated rope theta and produces the identical L2-normalized embeddings
+    (probe-verified), so remote code must stay OFF here. Contrast ``MidashengLMLoader`` /
+    ``Qwen2RewardLoader``, whose model classes are genuinely absent from transformers and DO require it.
     """
 
     model_type = "qwen2_gte"
@@ -936,7 +978,7 @@ class Qwen2GteLoader(Qwen2Loader):
     template = "dummy"
     task_type = "embedding"
     model_framework = "sentence_transformers"
-    trust_remote_code = True
+    trust_remote_code = False
     models = [
         ("iic/gte_Qwen2-1.5B-instruct", "Alibaba-NLP/gte-Qwen2-1.5B-instruct"),
         ("iic/gte_Qwen2-7B-instruct", "Alibaba-NLP/gte-Qwen2-7B-instruct"),

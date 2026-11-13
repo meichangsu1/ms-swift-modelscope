@@ -38,14 +38,29 @@ def process_configs(
     megatron_config: Optional['MegatronConfig'] = None,
     quantize_config: Optional['QuantizeConfig'] = None,
     plugin_config: Optional['PluginConfig'] = None,
+    reward_config: Optional['RewardConfig'] = None,
 ) -> None:
     """Load configured plugins and resolve every cross-Config derived value in place.
 
     Idempotent: running it twice leaves the same result, so callers may repeat the lifecycle.
     """
-    # Bridge enable_npu_model_patch to the env var BEFORE the first swift.model import (the patch
-    # applies once at import and reads this var); create_workers copies os.environ to every worker.
-    os.environ['SWIFT_ENABLE_NPU_MODEL_PATCH'] = str(bool(model_config.enable_npu_model_patch))
+    # Bridge the NPU model-patch switch to the env var BEFORE the first swift.model import (the
+    # patch applies once at import and reads this var); create_workers copies os.environ to every
+    # worker. The switch is platform-detected, not user-configured: the model patch imports
+    # torch_npu unconditionally, so a torch_npu-less host (GPU/MPS/CPU) must keep it OFF while
+    # NPU keeps it ON. Legacy v4 still accepts the argv flag; the env var set here wins there.
+    from twinkle.utils import Platform
+    _npu_patch = str(Platform.get_platform().__name__ == 'NPU')
+    # An externally set value that disagrees with the platform verdict is being overridden here;
+    # say so rather than silently swallowing it (the env is v5's authority, but the clobber should
+    # be visible to whoever set it).
+    _external = os.environ.get('SWIFT_ENABLE_NPU_MODEL_PATCH')
+    if _external is not None and _external != _npu_patch:
+        logger.warning(
+            f'SWIFT_ENABLE_NPU_MODEL_PATCH={_external} was set externally but the platform is '
+            f'{Platform.get_platform().__name__}; overriding to {_npu_patch} (the model patch '
+            'imports torch_npu unconditionally, so the switch follows the platform).')
+    os.environ['SWIFT_ENABLE_NPU_MODEL_PATCH'] = _npu_patch
 
     from swift.dev.builders import is_megatron_backend
     from swift.dev.utils.plugin import PluginRegistry
@@ -63,12 +78,13 @@ def process_configs(
     _derive_eval_schedule(train_config, dataset_config, checkpoint_config)
     _derive_streaming_dataloader_workers(dataset_config)
     _derive_bnb_compute_dtype(model_config, quantize_config)
-    _derive_rlhf_task_type(model_config, rl_config)
-    _derive_rlhf_beta(rl_config)
-    _derive_rlhf_loss_scale(template_config, rl_config, rollout_config)
-    _derive_rlhf_ref_model(model_config, tuner_config, rl_config)
-    _derive_rlhf_teacher(model_config, tuner_config, rl_config)
+    _derive_rl_task_type(model_config, rl_config)
+    _derive_rl_beta(rl_config)
+    _derive_rl_loss_scale(template_config, rl_config, rollout_config)
+    _derive_rl_ref_model(model_config, tuner_config, rl_config)
+    _derive_rl_teacher(model_config, tuner_config, rl_config)
     _derive_grpo_reward_defaults(rl_config)
+    _derive_reward_rule_defaults(reward_config, rl_config)
     _derive_best_model_metric(train_config, rl_config)
     _normalize_recompute_granularity(distributed_config)
     _derive_lr_decay_style(train_config, is_megatron)
@@ -104,6 +120,7 @@ def process_and_validate_configs(
         megatron_config=configs.get('megatron_config'),
         quantize_config=configs.get('quantize_config'),
         plugin_config=configs.get('plugin_config'),
+        reward_config=configs.get('reward_config'),
     )
     validate_configs(
         configs['model_config'],
@@ -131,12 +148,9 @@ def process_and_validate_configs(
         # Fold the legacy ``async_generate`` bool into ``async_mode`` BEFORE validation reads it, so
         # ``async_mode`` is the one source of truth downstream (process modifies, validate only reads).
         _derive_async_mode(rollout_config)
-        # A full-parameter or colocated run's only sound publication is in_place; derive from the
-        # defaults BEFORE validation reads them, so a legacy colocated script needs no extra flags.
-        _derive_weight_sync_strategy(rollout_config, configs.get('rl_config'), configs.get('tuner_config'))
-        # max_turns lives on the RolloutConfig itself; rl_config/tuner_config tell _check_async_mode and
-        # _check_rollout_tools the training/tuner surface (None = sampling).
-        validate_rollout_config(rollout_config, configs.get('rl_config'), configs.get('tuner_config'))
+        # max_turns lives on the RolloutConfig itself; rl_config tells _check_async_mode and
+        # _check_rollout_tools the training surface (None = sampling).
+        validate_rollout_config(rollout_config, configs.get('rl_config'))
     infer_config = configs.get('infer_config')
     if infer_config is not None:
         from .validate import validate_infer_config
@@ -272,7 +286,6 @@ def _derive_gradient_accumulation_steps(train_config: 'TrainConfig', distributed
         raise ValueError('global_batch_size is a Megatron-only derived setting. Use '
                          'gradient_accumulation_steps with the transformers backend.')
 
-    import os
     world_size = int(os.environ.get('WORLD_SIZE') or distributed_config.nproc_per_node or 1)
     tp = distributed_config.tensor_model_parallel_size
     pp = distributed_config.pipeline_model_parallel_size
@@ -386,7 +399,8 @@ def _derive_grad_accum_dtype(model_config: 'ModelConfig', train_config: 'TrainCo
     if (not is_megatron or train_config.accumulate_allreduce_grads_in_fp32
             or 'accumulate_allreduce_grads_in_fp32' in explicit):
         return
-    if model_config.torch_dtype == 'bfloat16' and train_config.main_grads_dtype == 'fp32':
+    dtype = model_config.torch_dtype or 'bfloat16'
+    if dtype == 'bfloat16' and train_config.main_grads_dtype == 'fp32':
         train_config.accumulate_allreduce_grads_in_fp32 = True
 
 
@@ -399,22 +413,18 @@ def _derive_per_token_loss(model_config: 'ModelConfig', train_config: 'TrainConf
     if not is_megatron or train_config.calculate_per_token_loss is not None:
         return
     is_causal_lm = model_config.task_type in (None, 'causal_lm')
-    is_rlhf = rl_config is not None and getattr(rl_config, 'rl_type', None) is not None
-    train_config.calculate_per_token_loss = is_causal_lm and not is_rlhf
+    is_rl = rl_config is not None and getattr(rl_config, 'rl_type', None) is not None
+    train_config.calculate_per_token_loss = is_causal_lm and not is_rl
 
 
 def _derive_vit_gradient_checkpointing(train_config: 'TrainConfig',
                                        tuner_config: Optional['TunerConfig']) -> None:
-    """Checkpoint the vision tower unless it is frozen, matching the LLM tower (legacy sft_args:211).
-
-    Only fills in None; no TunerConfig (full-param) leaves the builder default.
-    """
-    if train_config.vit_gradient_checkpointing is not None or tuner_config is None:
+    """Follow the LLM tower's checkpointing; legacy keyed it off ``freeze_vit`` and lost it (#9945)."""
+    if train_config.vit_gradient_checkpointing is not None:
         return
-    freeze_vit = getattr(tuner_config, 'freeze_vit', None)
-    if freeze_vit is None:
+    if train_config.gradient_checkpointing is None:
         return
-    train_config.vit_gradient_checkpointing = not freeze_vit
+    train_config.vit_gradient_checkpointing = train_config.gradient_checkpointing
 
 
 def _derive_packing(dataset_config: 'DatasetConfig', template_config: 'TemplateConfig') -> None:
@@ -507,41 +517,7 @@ def _derive_async_mode(rollout_config: 'RolloutConfig') -> None:
         rollout_config.async_mode = 'one_step_off'
 
 
-def _derive_weight_sync_strategy(rollout_config: 'RolloutConfig', rl_config: Optional['RLConfig'],
-                                 tuner_config: Optional['TunerConfig']) -> None:
-    """Default a run that rides the streaming driver to the only publication its placement/tuner allow.
-
-    A full-param or colocated run derives in_place; an overlapping regime adds partial rollout. A
-    merge-only round loop (RFT, sync-only distillation) has no adapter-snapshot publication path at all,
-    so it derives in_place at every placement/tuner.
-    """
-    from .validate import _changed_fields, _merges_every_round, _streams_under_none
-    changed = _changed_fields(rollout_config)
-    if 'weight_sync_strategy' in changed:
-        # An explicit choice is left alone, so an adapter_snapshot on a full-param/colocated run
-        # still reaches validate._check_streaming_publication and is rejected there.
-        return
-    if _merges_every_round(rl_config):
-        # The loop ships the full LoRA-merged base every round (sync_weights(merge_and_sync=True)); an
-        # enable_lora sampler would park the base under .base_layer and the canonical-name merge would
-        # miss it. in_place is the only sound publication, independent of placement/tuner.
-        rollout_config.weight_sync_strategy = 'in_place'
-        return
-    mode = rollout_config.async_mode
-    # Under 'none' the publication knob is read only if the config actually rides the streaming
-    # driver; an overlapping mode always does. Skip the sync-only / non-online fallback.
-    if mode == 'none' and not _streams_under_none(rl_config):
-        return
-    tuner = getattr(tuner_config, 'tuner', 'full') if tuner_config is not None else 'full'
-    colocate = rollout_config.sampler_mode == 'colocate'
-    if not (colocate or tuner == 'full'):
-        return  # a disaggregated LoRA run pins each version by adapter path (the default) -- sound as-is.
-    rollout_config.weight_sync_strategy = 'in_place'
-    if mode != 'none' and 'allow_partial_rollout' not in changed:
-        rollout_config.allow_partial_rollout = True
-
-
-def _derive_rlhf_task_type(model_config: 'ModelConfig', rl_config: Optional['RLConfig']) -> None:
+def _derive_rl_task_type(model_config: 'ModelConfig', rl_config: Optional['RLConfig']) -> None:
     """A reward model is a single-logit sequence classifier (legacy rlhf_args.py::_init_rm).
 
     `rl_type=rm` trains a seq_cls head with num_labels=1; only fills in defaults.
@@ -556,20 +532,20 @@ def _derive_rlhf_task_type(model_config: 'ModelConfig', rl_config: Optional['RLC
 
 # rl_type -> its default `beta` (KL / deviation-from-reference weight). opsd/mopd are self-distillation
 # (no reference-KL term by default) and rft is plain rejection-sampling SFT, so all three take 0.
-_RLHF_BETA_DEFAULTS = {'grpo': 0.04, 'gkd': 0.5, 'simpo': 2.0, 'opsd': 0.0, 'mopd': 0.0, 'rft': 0.0}
+_RL_BETA_DEFAULTS = {'grpo': 0.04, 'gkd': 0.5, 'simpo': 2.0, 'opsd': 0.0, 'mopd': 0.0, 'rft': 0.0}
 
 
-def _derive_rlhf_beta(rl_config: Optional['RLConfig']) -> None:
+def _derive_rl_beta(rl_config: Optional['RLConfig']) -> None:
     """Fill the reference-deviation weight with the chosen algorithm's default.
 
     The scattered legacy defaults collected into one table; only fills None (`--beta 0` preserved).
     """
     if rl_config is None or rl_config.beta is not None:
         return
-    rl_config.beta = _RLHF_BETA_DEFAULTS.get(getattr(rl_config, 'rl_type', None), 0.1)
+    rl_config.beta = _RL_BETA_DEFAULTS.get(getattr(rl_config, 'rl_type', None), 0.1)
 
 
-def _derive_rlhf_loss_scale(template_config: 'TemplateConfig', rl_config: Optional['RLConfig'],
+def _derive_rl_loss_scale(template_config: 'TemplateConfig', rl_config: Optional['RLConfig'],
                             rollout_config: Optional['RolloutConfig'] = None) -> None:
     """Default the loss-mask strategy to the algorithm's sensible one (legacy _set_loss_scale).
 
@@ -587,7 +563,7 @@ def _derive_rlhf_loss_scale(template_config: 'TemplateConfig', rl_config: Option
         template_config.loss_scale = 'last_round'
 
 
-def _derive_rlhf_ref_model(model_config: 'ModelConfig', tuner_config: Optional['TunerConfig'],
+def _derive_rl_ref_model(model_config: 'ModelConfig', tuner_config: Optional['TunerConfig'],
                            rl_config: Optional['RLConfig']) -> None:
     """Point the reference model at the policy model when the algorithm needs one and none was given.
 
@@ -617,7 +593,7 @@ def _derive_rlhf_ref_model(model_config: 'ModelConfig', tuner_config: Optional['
             '--sync_ref_model.')
 
 
-def _derive_rlhf_teacher(model_config: 'ModelConfig', tuner_config: Optional['TunerConfig'],
+def _derive_rl_teacher(model_config: 'ModelConfig', tuner_config: Optional['TunerConfig'],
                          rl_config: Optional['RLConfig']) -> None:
     """Resolve self-distillation defaults without loading a teacher."""
     if rl_config is None:
@@ -658,17 +634,38 @@ def _derive_grpo_reward_defaults(rl_config: Optional['RLConfig']) -> None:
         }.get(estimator)
 
 
+def _derive_reward_rule_defaults(reward_config: Optional['RewardConfig'], rl_config: Optional['RLConfig']) -> None:
+    """Port legacy's rule-reward backfills (rlhf_args.py / rlhf_trainers arguments).
+
+    ``cosine_max_len`` and ``soft_max_length`` default to ``max_completion_length``; the soft
+    overlong reward still requires an explicit ``soft_cache_length`` (legacy asserts the same
+    instead of inventing one).
+    """
+    if reward_config is None or rl_config is None:
+        return
+    if 'cosine' in reward_config.orm and reward_config.cosine_max_len is None:
+        reward_config.cosine_max_len = rl_config.max_completion_length
+    if 'soft_overlong' in reward_config.orm:
+        if reward_config.soft_cache_length is None:
+            raise ValueError('The soft_cache_length must be set when using the soft_overlong reward.')
+        if reward_config.soft_max_length is None:
+            reward_config.soft_max_length = rl_config.max_completion_length
+
+
 def _derive_best_model_metric(train_config: 'TrainConfig', rl_config: Optional['RLConfig']) -> None:
     """Pick the metric that selects the best checkpoint, and which direction counts as better.
 
-    GRPO -> reward, generation -> ROUGE, else loss; PPO stays unset (loss not monotone in quality).
+    GRPO -> reward, generation -> ROUGE, else eval_loss; PPO stays unset (loss not monotone in
+    quality). The supervised eval loop publishes its metrics under ``eval_``-prefixed keys
+    (``utils.py::track_best`` reads this dict), so the val-loss default is ``eval_loss`` --
+    legacy's bare ``loss`` never matches a key there and silently disabled best-model tracking.
     """
     rl_type = getattr(rl_config, 'rl_type', None) if rl_config is not None else None
     if train_config.metric_for_best_model is None:
         if rl_type == 'grpo':
             train_config.metric_for_best_model = 'reward'
         elif rl_type != 'ppo':
-            train_config.metric_for_best_model = 'rouge-l' if train_config.predict_with_generate else 'loss'
+            train_config.metric_for_best_model = 'rouge-l' if train_config.predict_with_generate else 'eval_loss'
     if train_config.greater_is_better is None and train_config.metric_for_best_model is not None:
         train_config.greater_is_better = 'loss' not in train_config.metric_for_best_model
 

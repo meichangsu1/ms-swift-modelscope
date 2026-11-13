@@ -42,11 +42,9 @@ register_template(
 @dataclass
 class Llama3TemplateMeta(TemplateMeta):
     prefix: Prompt = field(default_factory=lambda: ["<|begin_of_text|>"])
-    prompt: Prompt = field(
-        default_factory=lambda: [
-            "<|start_header_id|>user<|end_header_id|>\n\n{{QUERY}}<|eot_id|>"
-            "<|start_header_id|>assistant<|end_header_id|>\n\n"
-        ]
+    prompt: Prompt = field(default_factory=lambda: ["<|start_header_id|>user<|end_header_id|>\n\n{{QUERY}}<|eot_id|>"])
+    response_opener: Optional[Prompt] = field(
+        default_factory=lambda: ["<|start_header_id|>assistant<|end_header_id|>\n\n"]
     )
     chat_sep: Optional[Prompt] = field(default_factory=lambda: ["<|eot_id|>"])
     suffix: Prompt = field(default_factory=lambda: ["<|eot_id|>"])
@@ -59,17 +57,24 @@ class Llama3TemplateMeta(TemplateMeta):
 register_template(Llama3TemplateMeta(LLMTemplateType.llama3))
 
 
-def _get_llama3_2_prefix() -> Prompt:
-    now = dt.datetime.now()
-    date_string = now.strftime("%d %b %Y")
+def _get_llama3_2_prefix(date_string: str) -> Prompt:
     date_prompt = f"Cutting Knowledge Date: December 2023\nToday Date: {date_string}"
     return [f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{date_prompt}\n\n{{{{SYSTEM}}}}<|eot_id|>"]
 
 
 @dataclass
 class Llama3_2TemplateMeta(Llama3TemplateMeta):
-    prefix: Prompt = field(default_factory=lambda: _get_llama3_2_prefix())
+    # the text jinja hardcodes this date while the mllama processor one takes transformers'
+    # default (today, '%d %b %Y'); keep the two apart so each render matches its own jinja
+    prefix: Prompt = field(default_factory=lambda: _get_llama3_2_prefix(get_env_args("today_date", str, "26 Jul 2024")))
     system_prefix: Optional[Prompt] = None
+
+
+@dataclass
+class Llama3_2VisionTemplateMeta(Llama3_2TemplateMeta):
+    prefix: Prompt = field(
+        default_factory=lambda: _get_llama3_2_prefix(get_env_args("today_date", str, dt.date.today().strftime("%d %b %Y")))
+    )
 
 
 register_template(Llama3_2TemplateMeta(LLMTemplateType.llama3_2))
@@ -122,7 +127,7 @@ class Llama3_2VisionTemplate(Template):
         return res
 
 
-register_template(Llama3_2TemplateMeta(MLLMTemplateType.llama3_2_vision, template_cls=Llama3_2VisionTemplate))
+register_template(Llama3_2VisionTemplateMeta(MLLMTemplateType.llama3_2_vision, template_cls=Llama3_2VisionTemplate))
 
 
 class Llama4Template(Template):
@@ -162,11 +167,11 @@ class Llama4Template(Template):
 @dataclass
 class Llama4TemplateMeta(TemplateMeta):
     prefix: Prompt = field(default_factory=lambda: ["<|begin_of_text|>"])
-    prompt: Prompt = field(
-        default_factory=lambda: [
-            "<|header_start|>user<|header_end|>\n\n{{QUERY}}<|eot|><|header_start|>assistant<|header_end|>\n\n"
-        ]
-    )
+    # the user block closes with <|eot|>: the jinja writes the assistant header once, right before
+    # the response, so consecutive user messages render back to back
+    prompt: Prompt = field(default_factory=lambda: ["<|header_start|>user<|header_end|>\n\n{{QUERY}}<|eot|>"])
+    response_opener: Optional[Prompt] = field(
+        default_factory=lambda: ["<|header_start|>assistant<|header_end|>\n\n"])
     chat_sep: Optional[Prompt] = field(default_factory=lambda: ["<|eot|>"])
     suffix: Prompt = field(default_factory=lambda: ["<|eot|>"])
     stop_words: List[Word] = field(default_factory=lambda: ["<|end_of_text|>", "<|eom|>"])
@@ -178,17 +183,8 @@ class Llama4TemplateMeta(TemplateMeta):
 
 register_template(Llama4TemplateMeta(MLLMTemplateType.llama4, template_cls=Llama4Template))
 
-register_template(
-    Llama3TemplateMeta(
-        LLMTemplateType.reflection,
-        default_system=(
-            "You are a world-class AI system, capable of complex reasoning and reflection. "
-            "Reason through the query inside <thinking> tags, and then provide your final "
-            "response inside <output> tags. If you detect that you made a mistake in your reasoning "
-            "at any point, correct yourself inside <reflection> tags."
-        ),
-    )
-)
+# the official Reflection tokenizer template renders no default system
+register_template(Llama3TemplateMeta(LLMTemplateType.reflection))
 
 
 class Llama3_1OmniTemplate(Template):

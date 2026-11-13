@@ -7,7 +7,10 @@ from .descriptor import KIND_ALLOWS, KIND_CATEGORIES, ComponentDescriptor, Param
 REGISTRY_VERSION = 4
 ADVANTAGE_OPTIONS = ('grpo', 'grpo_passk', 'gae', 'rloo', 'remax', 'gpg', 'opo',
                      'reinforce_plus_plus', 'reinforce_pp_baseline')
-LOSS_OPTIONS = ('cross_entropy', 'channel', 'chunked_cross_entropy', 'mse', 'grpo', 'ppo',
+# Every name here must be resolvable by twinkle's torch_loss_mapping -- the loss component's
+# ``kind`` constructs straight out of that registry (the PPO preset ships kind='ppo'), so this
+# list is its webui-facing mirror, NOT the dev recipe's own loss mapping.
+LOSS_OPTIONS = ('cross_entropy', 'channel', 'mse', 'chunked_cross_entropy', 'grpo', 'ppo',
                 'ppo_value', 'gspo', 'sapo', 'cispo', 'bnpo', 'dr_grpo', 'real', 'gpg',
                 'gkd', 'opsd', 'mopd', 'kl_cov', 'clip_cov', 'geo_mean', 'dpo', 'kto',
                 'cpo', 'orpo', 'simpo', 'dro', 'dppo_kl', 'dppo_tv', 'infonce',
@@ -97,13 +100,16 @@ SCORER_COMP = D('scorer', '评分函数', 'Resource', 'r(tau)：规则评分函�
 TOOLSET = D('toolset', '工具集', 'Resource', '实际插件来源；运行实现按环境 lease 绑定，声明即插件模块内的实例。',
     ports_out=(P('tools', 'TOOL', '工具插件'),),
     params=(Q('plugins', '插件来源', [], type='list', item_type='str'),))
-SANDBOX_ENV = D('sandbox_env', '沙箱环境', 'Resource', '原生环境池与 lease 生命周期。',
-    ports_out=(P('env', 'ENV', '环境池'),), params=(Q('sandbox_config', '环境配置', {}, type='dict'),), owner_kind='ENV')
-POLICY_ENDPOINT = D('policy_endpoint', '本地推理服务', 'Resource', '复用常驻 sampler；只管理本会话拥有的应用。',
-    ports_in=(P('sampler', 'SAMPLER', '服务引擎'),),
-    ports_out=(P('endpoint', 'ENDPOINT', '就绪端点'),),
-    params=(Q('port', '端口', 8000, type='int', minimum=1, maximum=65535),
-            Q('server_config', '服务配置', {}, type='dict')), effects=('serve',), owner_kind='ENDPOINT')
+SANDBOX_ENV = D('sandbox_env', '沙箱环境', 'Resource', '原生环境池与 lease 生命周期；后端可换，消费面不变。',
+    ports_out=(P('env', 'ENV', '环境池'),),
+    params=(Q('kind', '沙箱后端', 'local', options=('local', 'agentenv', 'openenv', 'openenv_client'),
+              doc='local=本机 subprocess；agentenv=AgentENV microVM；'
+                  'openenv=进程内嵌 OpenEnv 环境；openenv_client=连运行中的 OpenEnv 服务'),
+            Q('sandbox_config', '环境配置', {}, type='dict',
+              doc='所选后端构造器的真实字段；未知名构造期拒绝'),
+            Q('api_key_env', '凭据环境变量名', '',
+              doc='仅 agentenv：构造期读取该环境变量作为 api_key；留空则由 SDK 读 E2B_API_KEY')),
+    owner_kind='ENV')
 API_ENDPOINT = D('api_endpoint', '外部 API', 'Resource', '明确外部连接；凭据仅从运行环境读取。',
     ports_out=(P('endpoint', 'ENDPOINT', '外部 API 连接'),),
     params=(Q('base_url', '服务地址', '', required=True), Q('model', '服务模型', '', required=True),
@@ -132,7 +138,7 @@ STREAMING_DRIVER = D('streaming_driver', '流式采样', 'Iterator', '采样准�
               P('episode', 'ROLLOUT', '多轮来源', optional=True),
               P('groups', 'GROUP_RULE', '完整组规则', optional=True),
               P('after', 'CTRL', '下一批反馈', optional=True)),
-    ports_out=(P('samples', 'TRAJ', '当前轨迹', ('rollout',)), P('source', 'SOURCE', '发布与确认控制', control=True)),
+    ports_out=(P('samples', 'TRAJ', '当前轨迹', ('rollout',)), P('source', 'SOURCE', '批次确认控制', control=True)),
     params=(Q('tokenizer', 'Tokenizer 来源（id/路径，与采样器一致）', '', required=True),
             Q('model_config', '模型加载配置', {}, type='dict',
               doc='tokenizer 加载所需的身份字段（如本地目录的 model_type）；与采样器节点自身一致'),
@@ -223,10 +229,18 @@ ADVANTAGE = D('advantage', '优势估计', 'Stage', '仅消费奖励、分组身
             Q('profile', '结果 Profile', 'row', options=('row', 'token'), phase='call'),
             Q('gamma', '折扣', 1.0, type='float', minimum=0, maximum=1, phase='call'),
             Q('lam', 'GAE lambda', 1.0, type='float', minimum=0, maximum=1, phase='call'),
+            # Declared like select's: the estimator's grouping needs the run's real width, and the
+            # old read (kwargs.pop('num_generations', 8)) was an undeclared key pinned at 8 that
+            # silently mis-grouped any wider/narrower generate node. Must match it.
+            Q('num_generations', '分组宽度', 8, type='int', minimum=1, phase='call'),
             Q('kwargs', '估计参数', {}, type='dict', phase='call')),
     required_when=(('estimator', 'gae', ('values',)), ('estimator', 'remax', ('baseline',))),
     execution='remote')
-SIGNAL_COMBINE = D('signal_combine', '数值组合', 'Stage', '对齐通道的加权和或概率混合；logps 概率混合使用 logsumexp。',
+# 'weighted_sum' is a weighted MEAN -- the implementation divides by the total weight, so the
+# weights act as mixture coefficients (scale-invariant) the way the sibling probability_mixture
+# mode's are. The descriptor text says so; the option key keeps its name (it is the graph
+# parameter surface, and mixture semantics is what existing pinned behavior expects).
+SIGNAL_COMBINE = D('signal_combine', '数值组合', 'Stage', '对齐通道的加权平均（权重为混合系数，同比缩放结果不变）或概率混合；logps 概率混合使用 logsumexp。',
     ports_in=(P('signals', 'SIGNAL', '具名对齐数值', many=True, accepted_kinds=('ADV',)),),
     ports_out=(P('out', 'SIGNAL', '与输入数学类型一致', mirror_input='signals'),),
     params=(Q('mode', '运算', 'weighted_sum', options=('weighted_sum', 'probability_mixture'), phase='call'),
@@ -241,7 +255,12 @@ SELECT = D('select', '样本筛选', 'Stage', '一次选择索引应用全部对
                P('signals', 'SIGNAL', '逐 slot 同步输出', optional=True, mirror_input='signals')),
     params=(Q('select', '选择规则', 'threshold', options=('threshold', 'top_k', 'best_of_n'), phase='call'),
             Q('threshold', '阈值', 0.0, type='float', phase='call'),
-            Q('top_k', '保留数', 1, type='int', minimum=1, phase='call')))
+            Q('top_k', '保留数', 1, type='int', minimum=1, phase='call'),
+            # Declared so best_of_n/top_k can actually group at the run's width: the component
+            # reads it, but an undeclared key is rejected by validate_params -- the grouping was
+            # pinned at the default 8 and silently mis-grouped any wider/narrower generate node.
+            # Must match the upstream generate/driver num_generations.
+            Q('num_generations', '分组宽度', 8, type='int', minimum=1, phase='call')))
 TRAIN_STEP = D('train_step', '训练步骤', 'Stage', '真实 forward_backward 与 optimizer step；优化器与编码是参数，不负责保存和发布 cadence。',
     ports_in=(P('model', 'MODEL', '实际更新模型；未接线时沿连线共享的作用域唯一解析', access='write', scope=True),
               P('loss', 'LOSS', '损失对象'),
@@ -267,7 +286,7 @@ TRAIN_STEP = D('train_step', '训练步骤', 'Stage', '真实 forward_backward �
             Q('gradient_accumulation_steps', '梯度累积步数', 1, type='int', minimum=1, phase='call'),
             Q('max_grad_norm', '梯度裁剪', 1.0, type='float', minimum=0, phase='call')),
     effects=('train',))
-WEIGHT_SYNC = D('weight_sync', '权重同步', 'Stage', '经原生分桶传输；流式发布登记、commit 后确认，不虚报 pending 完成。',
+WEIGHT_SYNC = D('weight_sync', '权重同步', 'Stage', '经原生分桶传输；同步完成后才确认，不虚报 pending 完成。',
     ports_in=(P('model', 'MODEL', '权重来源；未接线时沿连线共享的作用域唯一解析', scope=True),
               P('targets', 'SAMPLER', '明确接收者', many=True, access='write'),
               P('source', 'SOURCE', '流式控制句柄，不触发 take', optional=True, control=True),
@@ -291,6 +310,7 @@ CHECKPOINT = D('checkpoint', '保存检查点', 'Stage', '实际模型导出与�
     ports_out=(P('artifact', 'ARTIFACT', '实际写出产物', profile_param='profile'),),
     params=(Q('name', '保存名', 'checkpoint', phase='call'),
             Q('profile', '保存内容', 'model', options=('model', 'training'), phase='call'),
+            Q('output_dir', '输出目录', 'output/checkpoints', phase='call'),
             Q('cadence', '保存间隔', 1, type='int', minimum=1, phase='call')),
     required_when=(('profile', 'training', ('step', 'source')),), effects=('save',))
 
@@ -330,7 +350,7 @@ HUB_PUSH = D('hub_push', '发布模型', 'Task', '明确授权后调用公共 Hu
 
 REGISTRY = {descriptor.type: descriptor for descriptor in (
     MODEL, DATASET, SAMPLER, ROLLOUT, GROUP_RULE, LOSS_COMP, SCORER_COMP,
-    TOOLSET, SANDBOX_ENV, POLICY_ENDPOINT, API_ENDPOINT, CODE_COMPONENT,
+    TOOLSET, SANDBOX_ENV, API_ENDPOINT, CODE_COMPONENT,
     DATALOADER, STREAMING_DRIVER, CHALLENGER, GENERATE, SCORE,
     MODEL_FORWARD, REDUCE, REWARD_SHAPE, ADVANTAGE, SIGNAL_COMBINE, SELECT,
     TRAIN_STEP, WEIGHT_SYNC, WEIGHT_AVERAGE, CHECKPOINT, MERGE, QUANTIZE,

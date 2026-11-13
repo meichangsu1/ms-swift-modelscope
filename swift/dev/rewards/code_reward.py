@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
 
 from swift.dev.utils import get_logger
+from twinkle.data_format import ground_truth, last_assistant_text
 from .reward import ORM
 
 logger = get_logger()
@@ -110,6 +111,32 @@ def _parse_test_cases(raw: Any) -> List[Tuple[str, str]]:
     return [(str(i), str(o)) for i, o in zip(inputs, outputs)]
 
 
+def _parse_verification_info(raw: Any) -> List[Tuple[str, str]]:
+    """An OpenR1 ``verification_info`` cell -> ``[(stdin, expected_stdout), ...]``.
+
+    The verifiable-coding dataset family (``open-r1/verifiable-coding-problems-*``) ships its
+    cases this way -- a JSON string or decoded mapping holding ``language`` and
+    ``test_cases: [{"input": ..., "output": ...}]`` -- so the reward scores those datasets
+    directly instead of requiring a preprocessed ``test_cases`` column. A cell that cannot be
+    parsed yields ``[]`` (scored 0 with a warning), same policy as ``_parse_test_cases``.
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            logger.warning(f'code_execution reward: unparseable verification_info JSON, scoring 0: {raw[:120]!r}')
+            return []
+    cases = raw.get('test_cases') if isinstance(raw, dict) else None
+    if not isinstance(cases, list):
+        logger.warning(f'code_execution reward: verification_info.test_cases is not a list, scoring 0: '
+                       f'{type(raw).__name__}')
+        return []
+    parsed = [(str(c.get('input', '')), str(c.get('output', ''))) for c in cases if isinstance(c, dict)]
+    if len(parsed) != len(cases):
+        logger.warning('code_execution reward: some verification_info test cases were not mappings, dropped.')
+    return parsed
+
+
 def _normalize_output(text: str) -> List[str]:
     """Lines with trailing whitespace stripped and leading/trailing blank lines dropped.
 
@@ -206,15 +233,16 @@ def _build_run(language: str, code: str, test_input: str) -> Tuple[str, str]:
     return 'shell', _shell_source(_SHELL_LANGS[lang], code, test_input)
 
 
-def _execute_one(env: Any, code: str, test_input: str, language: str, timeout: int) -> Optional[str]:
-    """Run one program against one test case in a worker thread; blocking, hence the executor.
+def _execute_one(env: Any, episode_id: str, code: str, test_input: str, language: str,
+                 timeout: int) -> Optional[str]:
+    """Run one program against one test case in the episode's session; blocking, hence the executor.
 
     Returns the program's captured stdout, or None when the wrapper never completed -- a timeout, a build
     failure, a hard crash -- every one of which is a wrong answer. Scoring keys off stdout alone, the way
     a judge does, so the exit code ``run_script`` also returns is dropped here.
     """
     interpreter, source = _build_run(language, code, test_input)
-    _exit_code, merged = env.run_script(source, interpreter, timeout=timeout)
+    _exit_code, merged = env.run_script(episode_id, source, interpreter, timeout=timeout)
     return _extract_stdout(merged)
 
 
@@ -239,49 +267,70 @@ class CodeExecutionReward(ORM):
     def _build_env(self) -> Any:
         """A throwaway execution env: ``LocalEnv`` by default, ``AgentEnv`` when a template is named.
 
-        Built once per scoring batch and shared across its concurrent runs -- safe because ``LocalEnv``
-        with ``workspace=None`` gives every ``run_script`` its own temp dir, and the shell wrapper's
-        uuid filenames keep concurrent ``AgentEnv`` runs from colliding in its one workspace.
+        Built once per scoring batch; every program runs in a session of its own (its own directory
+        or sandbox), so concurrent runs never collide.
         """
         if self.sandbox_template:
             from twinkle_agentic.envs import AgentEnv
-            env = AgentEnv(
+            return AgentEnv(
                 template=self.sandbox_template,
+                max_sessions=self.max_concurrency,
                 command_timeout=self.timeout,
                 metadata={'run': 'swift', 'reward': 'code_execution'})
-            env.clear()  # boots the sandbox; run_script needs one up.
-            return env
         from twinkle_agentic.envs import LocalEnv
-        return LocalEnv(workspace=None, command_timeout=self.timeout, memory_limit_gb=self.memory_limit_gb)
+        return LocalEnv(max_sessions=self.max_concurrency, command_timeout=self.timeout,
+                        memory_limit_gb=self.memory_limit_gb)
 
     @staticmethod
     def _close_env(env: Any) -> None:
         try:
-            env.close()
+            env.shutdown()
         except Exception as exc:  # noqa: BLE001 -- teardown is best effort; the score is already computed
-            logger.warning(f'code_execution reward: env close failed: {type(exc).__name__}: {exc}')
+            logger.warning(f'code_execution reward: env shutdown failed: {type(exc).__name__}: {exc}')
+
+    @staticmethod
+    def _row_spec(trajectory: Any) -> Tuple[List[Tuple[str, str]], Optional[str]]:
+        """One trajectory row -> ``(test cases, language)``, from whichever column carries them.
+
+        ``test_cases`` (the packed ``{"inputs": [...], "outputs": [...]}`` form) wins when present;
+        otherwise the row is read as an OpenR1 ``verification_info`` cell, which carries the
+        language alongside the cases. ``([], None)`` when neither column exists -- the caller
+        fails loudly if NO row carries cases at all.
+        """
+        cases_raw = ground_truth(trajectory, 'test_cases')
+        if cases_raw is not None:
+            return _parse_test_cases(cases_raw), ground_truth(trajectory, 'language')
+        info = ground_truth(trajectory, 'verification_info')
+        if info is not None:
+            if isinstance(info, str):
+                try:
+                    info = json.loads(info)
+                except (ValueError, TypeError):
+                    info = None
+            language = info.get('language') if isinstance(info, dict) else None
+            return _parse_verification_info(info), language
+        return [], None
 
     async def __call__(self, trajectories, **kwargs) -> List[float]:
         """One score per trajectory: the fraction of its test cases the program passes.
 
-        ``test_cases`` and ``language`` ride each trajectory row (the packed ``user_data`` label or
-        the flat column); ``language`` may be absent to take ``code_language`` from the config.
+        ``test_cases`` (packed ``{"inputs": [...], "outputs": [...]}``) or an OpenR1
+        ``verification_info`` cell rides each trajectory row (the packed ``user_data`` label or
+        the flat column); a ``language`` label may accompany either to override ``code_language``.
         """
-        from twinkle.data_format import ground_truth, last_assistant_text
-
         completions = [last_assistant_text(t) for t in trajectories]
-        cases_raw = [ground_truth(t, 'test_cases') for t in trajectories]
-        if not any(case is not None for case in cases_raw):
-            raise ValueError("the 'code_execution' reward scores code against test cases, but no "
-                             "'test_cases' column was provided. Add one to the dataset as JSON "
-                             '\'{"inputs": [...], "outputs": [...]}\' (stdin / expected stdout per case).')
+        specs = [self._row_spec(t) for t in trajectories]
+        if not any(cases for cases, _lang in specs):
+            raise ValueError("the 'code_execution' reward scores code against test cases, but neither a "
+                             "'test_cases' column (JSON '{\"inputs\": [...], \"outputs\": [...]}') nor an "
+                             "OpenR1 'verification_info' column was provided.")
         n = len(trajectories)
-        lang_col = [ground_truth(t, 'language') or self.language for t in trajectories]
+        lang_col = [lang or self.language for _cases, lang in specs]
         for lang in set(lang_col):
             _check_language(lang)
 
         codes = [_extract_code(completion, lang) for completion, lang in zip(completions, lang_col)]
-        parsed = [_parse_test_cases(raw) for raw in cases_raw]
+        parsed = [cases for cases, _lang in specs]
 
         env = None
         executor = None
@@ -304,10 +353,18 @@ class CodeExecutionReward(ORM):
                          cases: List[Tuple[str, str]], language: str) -> float:
         if not cases:
             return 0.0
-        passed = 0
-        for test_input, expected in cases:
-            actual = await loop.run_in_executor(executor, _execute_one, env, code, test_input, language,
-                                                self.timeout)
-            if actual is not None and _outputs_match(actual, expected):
-                passed += 1
+        return await loop.run_in_executor(executor, self._run_cases, env, code, cases, language)
+
+    def _run_cases(self, env: Any, code: str, cases: List[Tuple[str, str]], language: str) -> float:
+        """One program against all its test cases, in one env session."""
+        episode_id = uuid.uuid4().hex
+        env.reset(episode_id)
+        try:
+            passed = 0
+            for test_input, expected in cases:
+                actual = _execute_one(env, episode_id, code, test_input, language, self.timeout)
+                if actual is not None and _outputs_match(actual, expected):
+                    passed += 1
+        finally:
+            env.close(episode_id)
         return passed / len(cases)

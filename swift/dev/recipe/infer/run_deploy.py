@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 from swift.dev.utils.logger import get_logger
 
@@ -68,7 +68,7 @@ def run_deploy(
     # the data-plane is left untouched -- re-running it would drop in-flight DataRefs.
     gateway_models, skip_apps = [public_name], set()
     if existing:
-        gateway_models = sorted(set(_deployed_model_names(existing)) | {public_name})
+        gateway_models = sorted(set(_deployed_model_names()) | {public_name})
         if 'data-plane' in existing:
             skip_apps.add('data-plane')
 
@@ -264,11 +264,13 @@ def _serve_details() -> Dict[str, Any]:
         return {}
 
 
-def _deployed_model_names(apps: Dict[str, Any]) -> List[str]:
+def _deployed_model_names() -> List[str]:
     """Model names behind the running sampler apps.
 
     App names alone are lossy (``/`` became ``_``); the route prefix keeps the original name
-    verbatim in its ``.../sampler/{name}`` tail, so the names are read off the routes.
+    verbatim in its ``.../sampler/{name}`` tail, so the names are read off the controller's
+    live route table -- ``serve.status()`` entries carry no route prefix, hence the internal
+    ``_serve_details()`` poll rather than any caller-side snapshot.
     """
     names = []
     for name, details in _serve_details().items():
@@ -357,7 +359,7 @@ def stop_deployment(deploy_config: DeployConfig, model_config: Optional[ModelCon
 
     # serve.delete blocks until the app (and its replicas) are gone.
     serve.delete(sampler_app)
-    remaining = [name for name in _deployed_model_names(apps) if name != public_name]
+    remaining = [name for name in _deployed_model_names() if name != public_name]
     if 'server' in apps:
         if remaining:
             logger.info(f're-registering gateway without {public_name!r}: {remaining}')
@@ -440,6 +442,19 @@ def _warn_unapplied_generation_defaults(generation_config: Optional[GenerationCo
         logger.warning(f'swift deploy serves through twinkle-server, which applies sampling per request: the '
                        f'GenerationConfig default(s) {set_fields} are NOT injected server-side. Send them in '
                        'each request body (temperature/top_p/max_tokens/...) instead.')
+    # Knobs the per-request translation has no field for at all (the infer entry point rejects these
+    # by name); naming them here keeps a deploy run from silently dropping them.
+    unsupported = []
+    if generation_config.logprobs or generation_config.top_logprobs is not None:
+        unsupported.append('logprobs/top_logprobs')
+    if generation_config.num_beams and generation_config.num_beams > 1:
+        unsupported.append(f'num_beams={generation_config.num_beams}')
+    if generation_config.structured_outputs_regex:
+        unsupported.append('structured_outputs_regex')
+    if unsupported:
+        logger.warning(f'swift deploy serves through twinkle-server, which has no server-side counterpart '
+                       f'for {unsupported}: the settings are dropped. Drop them from the deploy config, or '
+                       'run swift infer if you need them.')
 
 
 def _local_head_running() -> bool:
@@ -596,8 +611,28 @@ def run_deploy_process(*args, port: int = 8000, timeout: float = 300.0, **kwargs
             target=run_deploy, args=args, kwargs=kwargs, daemon=True)
         process.start()
         try:
+            # The gateway proxy answers /models as soon as Ray Serve mounts it, but the vLLM/SGLang
+            # sampler keeps loading the engine for another minute or so; a caller handed the URL at
+            # that point 404s (sampler route not yet proxied) or 503s (pool not ready) on every
+            # generation route. Wait for one real generation to succeed so the yielded endpoint can
+            # actually serve -- the same readiness the blocking/detach CLI paths wait for. The probe
+            # is a 1-token completion: the sampler app is mounted under a dynamic resource-pool route
+            # the parent cannot reconstruct, so the only stable readiness signal is the generation
+            # path itself.
+            model_config = args[0] if args else kwargs.get('model_config')
+            ready_probe = None
+            if model_config is not None:
+                public_name = _public_name(deploy_config, model_config)
+                ready_probe = (f'{scheme}://127.0.0.1:{port}{deploy_config.route_prefix}/completions',
+                               {'model': public_name, 'prompt': 'hello', 'max_tokens': 1})
             _wait_until_accessible(
-                port, timeout, process, deploy_config.route_prefix, scheme, api_key=deploy_config.api_key)
+                port,
+                timeout,
+                process,
+                deploy_config.route_prefix,
+                scheme,
+                api_key=deploy_config.api_key,
+                ready_probe=ready_probe)
             yield f'{scheme}://127.0.0.1:{port}{deploy_config.route_prefix}'
         finally:
             process.terminate()
@@ -609,7 +644,9 @@ def run_deploy_process(*args, port: int = 8000, timeout: float = 300.0, **kwargs
 
 
 def _wait_until_accessible(port: int, timeout: float, process, route_prefix: str, scheme: str = 'http',
-                           api_key: Optional[str] = None) -> None:
+                           api_key: Optional[str] = None, ready_probe: Optional[Tuple[str, Dict[str,
+                                                                                                Any]]] = None
+                           ) -> None:
     """Poll ``{route_prefix}/models`` until it answers 200, failing fast if the child dies first.
 
     An HTTP probe, not a bare socket connect: the port opens when Ray Serve's proxy is up, but the
@@ -619,26 +656,41 @@ def _wait_until_accessible(port: int, timeout: float, process, route_prefix: str
     ``api_key`` rides along as a Bearer header: when auth is on the gateway answers an unauthenticated
     probe with 401 FOREVER (the server is healthy but the probe can never see it), so the readiness
     handshake must present the same credential the caller will use.
+
+    ``ready_probe`` is a ``(url, body)`` minimal generation request: the gateway answers ``/models``
+    long before the sampler engine finishes loading, so a second phase parks until one real generation
+    returns 200 (the route 404s while the sampler app is still mounted and 503s while the pool warms).
+    Without it a caller receives a URL whose generation routes are not yet live.
     """
+    import json
     import ssl
     import time
     import urllib.error
     import urllib.request
 
-    url = f'{scheme}://127.0.0.1:{port}{route_prefix}/models'
-    headers = {'Authorization': f'Bearer {api_key}'} if api_key else {}
+    auth = {'Authorization': f'Bearer {api_key}'} if api_key else {}
     context = ssl._create_unverified_context() if scheme == 'https' else None
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not process.is_alive():
-            raise RuntimeError(f'deploy subprocess exited with code {process.exitcode} before the endpoint '
-                               "opened; its traceback is on this process's stderr.")
-        try:
-            request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=2.0, context=context) as response:
-                if response.status == 200:
-                    return
-        except (urllib.error.URLError, OSError, ValueError):
-            pass
-        time.sleep(1.0)
-    raise TimeoutError(f'deploy did not become accessible at {url} within {timeout}s.')
+
+    def _poll(url: str, body: Optional[Dict[str, Any]]) -> None:
+        data = json.dumps(body).encode() if body is not None else None
+        headers = dict(auth)
+        if data is not None:
+            headers['Content-Type'] = 'application/json'
+        while time.time() < deadline:
+            if not process.is_alive():
+                raise RuntimeError(f'deploy subprocess exited with code {process.exitcode} before the endpoint '
+                                   "opened; its traceback is on this process's stderr.")
+            try:
+                request = urllib.request.Request(url, data=data, headers=headers)
+                with urllib.request.urlopen(request, timeout=10.0, context=context) as response:
+                    if response.status == 200:
+                        return
+            except (urllib.error.URLError, OSError, ValueError):
+                pass
+            time.sleep(1.0)
+        raise TimeoutError(f'deploy did not become ready at {url} within {timeout}s.')
+
+    _poll(f'{scheme}://127.0.0.1:{port}{route_prefix}/models', None)
+    if ready_probe is not None:
+        _poll(ready_probe[0], ready_probe[1])

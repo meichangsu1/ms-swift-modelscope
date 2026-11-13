@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import json
 
@@ -22,8 +22,11 @@ class MiniCPM5AgentTemplate(BaseAgentTemplate):
     """
 
     tool_call_start = "<function"
+    # The wire format carries no type marker, so a string argument must be told apart from a number
+    # by the tool schema.
+    supports_tool_schema = True
 
-    def get_toolcall(self, response: str) -> List[Function]:
+    def get_toolcall(self, response: str, tools: Optional[List[Any]] = None) -> List[Function]:
         # Match <function name="...">...</function> blocks
         func_pattern = re.compile(r'<function\s+name="([^"]+)">(.*?)</function>', re.DOTALL)
         param_pattern = re.compile(
@@ -32,27 +35,22 @@ class MiniCPM5AgentTemplate(BaseAgentTemplate):
             r"</param>",
             re.DOTALL,
         )
+        tool_schemas = self._tool_schemas(tools)
 
         functions = []
         for func_match in func_pattern.finditer(response):
             func_name = func_match.group(1)
             func_body = func_match.group(2)
-            arguments = {}
+            pairs = []
             for param_match in param_pattern.finditer(func_body):
-                param_name = param_match.group(1)
-                # CDATA value or plain value
                 param_value = param_match.group(2) if param_match.group(2) is not None else param_match.group(3)
-                # Try to parse as JSON value (number, bool, etc.)
-                try:
-                    param_value = json.loads(param_value)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-                arguments[param_name] = param_value
+                pairs.append((param_match.group(1), param_value))
+            arguments = BaseAgentTemplate._decode_schema_args(pairs, tool_schemas, func_name)
             functions.append(Function(name=func_name, arguments=arguments))
 
         if len(functions) == 0:
             # Fallback to ReAct-style parsing
-            return super().get_toolcall(response)
+            return super().get_toolcall(response, tools)
         return functions
 
     def _get_tool_responses(self, tool_messages):
@@ -72,11 +70,11 @@ class MiniCPM5AgentTemplate(BaseAgentTemplate):
             return super()._format_tool_responses(assistant_content, tool_messages)
         if hasattr(self, "template_meta"):
             prompt = self.template_meta.prompt
-            chat_sep = self.template_meta.chat_sep
         else:
-            prompt = ["<|im_start|>user\n{{QUERY}}<|im_end|>\n<|im_start|>assistant\n"]
-            chat_sep = ["<|im_end|>\n"]
-        res = chat_sep.copy()
+            prompt = ["<|im_start|>user\n{{QUERY}}<|im_end|>\n"]
+        # no separator prefix: the encode loop emits chat_sep after the previous response, and
+        # the opener (split out of prompt) right before this round's response
+        res = []
         total_tool = self._get_tool_responses(tool_messages)
         for context in prompt:
             if isinstance(context, str):

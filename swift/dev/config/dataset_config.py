@@ -37,6 +37,14 @@ class DatasetConfig:
     model_author: Optional[List[str]] = None
     custom_dataset_info: List[str] = field(default_factory=list)
 
+    # === Decision augmentation ===
+    # schema augmentation applied by every ScoringPreprocessor a
+    # loaded dataset carries, between parse_record and _build_row. All-zero/False (the default)
+    decision_drop_instructions: float = 0.0
+    decision_subsample_options: int = 0
+    decision_state_as_text: float = 0.0
+    decision_shuffle_fields: bool = False
+
     # === Hub ===
     use_hf: bool = False
     hub_token: Optional[str] = None
@@ -58,7 +66,12 @@ class DatasetConfig:
     data_sharding: bool = False  # megatron only
     dataloader_num_workers: Optional[int] = None
     dataloader_pin_memory: bool = True
-    dataloader_persistent_workers: bool = False
+    # Default True: respawning workers on every eval cold-starts the dataset (map/collate recompute), which
+    # dominated eval wall time. Legacy uses the same default (#10036).
+    dataloader_persistent_workers: bool = True
+    # Worker start method; None keeps the platform default and lets packing pick spawn when fork would
+    # dead-lock (CUDA/dist already initialized, #9979).
+    dataloader_multiprocessing_context: Optional[str] = None
     dataloader_prefetch_factor: Optional[int] = None
     # Discard a final short batch: a step assuming a fixed batch size otherwise sees a different shape.
     dataloader_drop_last: bool = False

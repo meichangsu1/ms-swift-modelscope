@@ -279,17 +279,9 @@ def build_sampler(
         if not instance_id:
             raise ValueError("instance_id must be non-empty when provided.")
         extra["instance_id"] = instance_id
-    sampler = sampler_cls(model_config.model, engine_args=kwargs, device_mesh=device_mesh, **extra)
-    try:
-        if template is not None:
-            sampler.set_template(template)
-    except BaseException:
-        try:
-            sampler.close_workers()
-        except Exception:
-            logger.warning("Failed to close sampler workers after template init failed.", exc_info=True)
-        raise
-    return sampler
+    if template is not None:
+        extra["template"] = template
+    return sampler_cls(model_config.model, engine_args=kwargs, device_mesh=device_mesh, **extra)
 
 
 def _build_client_sampler(model_config: "ModelConfig", template: Any,
@@ -403,6 +395,12 @@ def to_sampling_params(generation_config: Optional[GenerationConfig] = None, **o
         for name in ("temperature", "top_k", "top_p", "repetition_penalty"):
             value = getattr(generation_config, name)
             if value is not None:
+                if name == "top_k" and value == 0:
+                    # HF spells "disabled" as 0; the sampler side spells it -1. The model-default
+                    # backfill already maps this, but a user's explicit --top_k 0 (or an API-built
+                    # GenerationConfig) went straight to SamplingParams and was rejected -- the
+                    # CLI/API surface and the baseline path disagreed on one spelling.
+                    value = -1
                 params[name] = value
         if generation_config.stop_words:
             params["stop"] = list(generation_config.stop_words)
@@ -414,6 +412,12 @@ def to_sampling_params(generation_config: Optional[GenerationConfig] = None, **o
 
 def _reject_unsupported(generation_config: GenerationConfig) -> None:
     """Fail loudly on GenerationConfig knobs twinkle's SamplingParams has no field for."""
+    # top_logprobs only rides the logprobs flag (``params['logprobs'] = top_logprobs or 0`` is built
+    # under it); alone it is silently ignored, so refuse the dead combination here.
+    if generation_config.top_logprobs is not None and not generation_config.logprobs:
+        raise ValueError(
+            f'top_logprobs={generation_config.top_logprobs} needs --logprobs true: the top-k logprobs '
+            'only ride the logprobs flag, so without it the setting is silently ignored.')
     if generation_config.num_beams and generation_config.num_beams > 1:
         raise ValueError(
             f"num_beams={generation_config.num_beams} is not supported: twinkle SamplingParams "

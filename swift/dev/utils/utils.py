@@ -52,12 +52,27 @@ def add_version_to_work_dir(work_dir: str) -> str:
     """``work_dir/v{version}-{timestamp}`` so repeated runs nest instead of overwriting.
 
     The broadcast keeps every rank on the same sub-folder when a torchrun process group exists
-    (only the rank-0 listing decides); single-process callers fall straight through.
+    (only the rank-0 listing decides); single-process callers fall straight through. The dev
+    local mode initializes no world process group at config time (twinkle initializes none at
+    all, world size comes from the torchrun env), so under torchrun a transient gloo group
+    carries the broadcast and is torn down before megatron builds its own groups -- without
+    it every rank nests into its own version dir and the checkpoint write scatters its shards
+    across eight roots (rank-0 config here, tokenizer there, an empty dir where the task-head
+    writer then crashes).
     """
     version = _next_output_version(work_dir)
     timestamp = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
     sub_folder = f'v{version}-{timestamp}'
-    if dist.is_initialized() and dist.get_world_size() > 1:
+    world_size = int(os.environ.get('WORLD_SIZE', '1') or '1')
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group(backend='gloo')
+        try:
+            obj_list = [sub_folder]
+            dist.broadcast_object_list(obj_list, src=0)
+            sub_folder = obj_list[0]
+        finally:
+            dist.destroy_process_group()
+    elif dist.is_initialized() and dist.get_world_size() > 1:
         obj_list = [sub_folder]
         dist.broadcast_object_list(obj_list)
         sub_folder = obj_list[0]
@@ -139,9 +154,10 @@ def split_list(ori_list: List[_T], num_shards: int, contiguous=True) -> List[Lis
         for i in range(len(idx_list) - 1):
             shard.append(ori_list[idx_list[i]:idx_list[i + 1]])
     else:
-        ori_list = np.array(ori_list)
+        # Slice the list directly: np.array() coerces a heterogeneous list into a single dtype and, for a
+        # list of tensors/arrays, would either raise or silently reshape the items.
         for i in range(num_shards):
-            shard.append(ori_list[np.arange(i, len(ori_list), num_shards)].tolist())
+            shard.append(ori_list[i::num_shards])
     return shard
 
 
@@ -256,6 +272,40 @@ def deepspeed_zero_stage(spec: Union[str, Dict, None]) -> Optional[int]:
         return None
     stage = (config.get('zero_optimization') or {}).get('stage')
     return int(stage) if stage is not None else None
+
+
+# The FSDP2 preset maps to the bundled JSON (swift/config/fsdp2.json), exactly like the legacy CLI's
+# ``_init_fsdp``; any other existing path is read as a custom FSDP config file. Shared by the model
+# builder so the preset and the file semantics live in one place.
+_FSDP_PRESETS = ('fsdp2',)
+
+
+def resolve_fsdp_config(fsdp: Optional[str], fsdp_config: Optional[Dict]) -> Optional[Dict]:
+    """Resolve the FSDP config the strategies receive, from ``--fsdp`` and ``--fsdp_config``.
+
+    Returns None when FSDP is off. A preset name or a JSON file path in ``--fsdp`` contributes the
+    file's ``fsdp_config`` section (the legacy contract); an explicit ``--fsdp_config`` dict is
+    merged on top so a user override beats the file default. Any other ``--fsdp`` value is neither
+    a preset nor a file, so it is rejected instead of silently selecting no config at all.
+    """
+    if not fsdp:
+        return dict(fsdp_config) if fsdp_config else None
+    if fsdp in _FSDP_PRESETS:
+        import swift
+        path = os.path.join(os.path.dirname(swift.__file__), 'config', f'{fsdp}.json')
+    elif os.path.exists(fsdp):
+        path = fsdp
+    else:
+        raise ValueError(
+            f'DistributedConfig.fsdp={fsdp!r} names neither an FSDP preset ({list(_FSDP_PRESETS)}) nor an '
+            'existing JSON config file, so it selects no FSDP configuration at all. Pass --fsdp fsdp2, a '
+            'path to a custom FSDP config file, or drop --fsdp.')
+    config = json_parse_to_dict(path)
+    if not isinstance(config, dict) or not isinstance(config.get('fsdp_config', {}), dict):
+        raise ValueError(f'The FSDP config file {path!r} must be a JSON object with a fsdp_config section.')
+    resolved = dict(config.get('fsdp_config', {}))
+    resolved.update(fsdp_config or {})
+    return resolved
 
 
 def deep_getattr(obj, attr: str, default=None):

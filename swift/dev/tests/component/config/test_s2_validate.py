@@ -52,10 +52,10 @@ from swift.dev.config.validate import (
     _check_prm,
     _check_quantization,
     _check_reference_sync,
-    _check_rlhf_advanced,
-    _check_rlhf_padding_free,
-    _check_rlhf_padding_side,
-    _check_rlhf_ref_model,
+    _check_rl_advanced,
+    _check_rl_padding_free,
+    _check_rl_padding_side,
+    _check_rl_ref_model,
     _check_router_replay,
     _check_sampling_replay,
     _check_save_total_limit,
@@ -64,6 +64,7 @@ from swift.dev.config.validate import (
     _check_streaming_publication,
     _check_tp_comm_overlap,
     _check_unsloth_strategy,
+    _check_unsloth_eval,
     _sync_only_feature,
     _streams_under_none,
     validate_infer_config,
@@ -84,18 +85,18 @@ def test_rlhf_advanced_grpo_only_gates():
     """S2-27: chord/advantage_reweight/sdar/dynamic_sample are GRPO-only; sync_ref_model needs
     grpo or ppo (the only reference-bearing algorithms)."""
     with pytest.raises(ValueError, match='GRPO-only'):
-        _check_rlhf_advanced(TrainConfig(), RLConfig(rl_type='dpo', chord_sft_dataset='d'))
+        _check_rl_advanced(TrainConfig(), RLConfig(rl_type='dpo', chord_sft_dataset='d'))
     with pytest.raises(ValueError, match='GRPO-only'):
-        _check_rlhf_advanced(TrainConfig(), RLConfig(rl_type='dpo', advantage_reweight='rlsd'))
+        _check_rl_advanced(TrainConfig(), RLConfig(rl_type='dpo', advantage_reweight='rlsd'))
     with pytest.raises(ValueError, match='GRPO-only'):
-        _check_rlhf_advanced(TrainConfig(), RLConfig(rl_type='kto', sdar_loss_coef=0.1))
+        _check_rl_advanced(TrainConfig(), RLConfig(rl_type='kto', sdar_loss_coef=0.1))
     with pytest.raises(ValueError, match='GRPO-only'):
-        _check_rlhf_advanced(TrainConfig(), RLConfig(rl_type='dpo', dynamic_sample=True))
+        _check_rl_advanced(TrainConfig(), RLConfig(rl_type='dpo', dynamic_sample=True))
     with pytest.raises(ValueError, match='grpo or ppo'):
-        _check_rlhf_advanced(TrainConfig(), RLConfig(rl_type='dpo', sync_ref_model=True))
+        _check_rl_advanced(TrainConfig(), RLConfig(rl_type='dpo', sync_ref_model=True))
     # a GRPO run with none of the knobs passes the gate (the later reward-channel guard needs a
     # channel; the deeper checks run on their own below)
-    _check_rlhf_advanced(TrainConfig(), RLConfig(rl_type='grpo', num_generations=4),
+    _check_rl_advanced(TrainConfig(), RLConfig(rl_type='grpo', num_generations=4),
                          RewardConfig(orm=['accuracy']))
 
 
@@ -165,9 +166,12 @@ def test_grpo_loss_type_gspo_is_sequence_level():
 def test_grpo_cached_dataset_and_truncation_refusals():
     """S2-31: GRPO rolls out from raw messages (cached_dataset would be ignored) and truncates
     prompts from the left only ('right' cuts what the completion conditions on)."""
-    with pytest.raises(ValueError, match='cached_dataset is not supported for GRPO'):
+    with pytest.raises(ValueError, match='cached_dataset is not supported for grpo'):
         _check_grpo_cached_dataset(DatasetConfig(cached_dataset=['c']), RLConfig(rl_type='grpo'))
     _check_grpo_cached_dataset(DatasetConfig(cached_dataset=['c']), RLConfig(rl_type='dpo'))
+    for rl_type in ('ppo', 'gkd', 'rft'):
+        with pytest.raises(ValueError, match=f'cached_dataset is not supported for {rl_type}'):
+            _check_grpo_cached_dataset(DatasetConfig(cached_dataset=['c']), RLConfig(rl_type=rl_type))
 
     with pytest.raises(ValueError, match="truncation_strategy 'left' or 'delete'"):
         _check_grpo_truncation_strategy(TemplateConfig(truncation_strategy='right'), RLConfig(rl_type='grpo'))
@@ -252,14 +256,20 @@ def test_prm_channel_and_scorer_knobs():
     with pytest.raises(ValueError, match='prm_orm_mix'):
         _check_prm(RLConfig(rl_type='grpo'), reward)
 
-    reward = RewardConfig(prm=['Qwen/PRM-7B'])
+    # prm-only with a blended mix folds NaN into every advantage: refuse it, and only the
+    # pure-process mix=1 stays valid without an --orm channel.
+    with pytest.raises(ValueError, match='blends an --orm half'):
+        _check_prm(RLConfig(rl_type='grpo'), RewardConfig(prm=['Qwen/PRM-7B'], prm_orm_mix=0.5))
+    _check_prm(RLConfig(rl_type='grpo'), RewardConfig(prm=['Qwen/PRM-7B'], prm_orm_mix=1.0))
+
+    reward = RewardConfig(prm=['Qwen/PRM-7B'], orm=['accuracy'])
     with pytest.raises(ValueError, match='RLSD/SDAR'):
         _check_prm(RLConfig(rl_type='grpo', advantage_reweight='rlsd'), reward)
-    reward = RewardConfig(prm=['Qwen/PRM-7B'])
+    reward = RewardConfig(prm=['Qwen/PRM-7B'], orm=['accuracy'])
     with pytest.raises(ValueError, match='RLSD/SDAR'):
         _check_prm(RLConfig(rl_type='grpo', sdar_loss_coef=0.1), reward)
 
-    _check_prm(RLConfig(rl_type='grpo'), RewardConfig(prm=['Qwen/PRM-7B'], prm_orm_mix=0.5))
+    _check_prm(RLConfig(rl_type='grpo'), RewardConfig(prm=['Qwen/PRM-7B'], orm=['accuracy'], prm_orm_mix=0.5))
 
 
 def test_distillation_family_and_self_distill():
@@ -276,6 +286,19 @@ def test_distillation_family_and_self_distill():
         _check_distillation(RLConfig(rl_type='gkd', sft_alpha=-1))
     _check_distillation(RLConfig(rl_type='gkd', lmbda=1.0, sft_alpha=0.1, distill_temperature=1.0))
 
+    # MOPD's teacher contradictions fire at validate time (not after the actors are built):
+    # a single teacher equal to the policy is the self-distillation derivation MOPD rejects, and an
+    # explicitly different teacher family is the unsupported heterogeneous forward (F-31/F-32).
+    policy = ModelConfig(model='student', model_type='qwen2_5_vl')
+    with pytest.raises(ValueError, match='does not apply here'):
+        _check_distillation(RLConfig(rl_type='mopd', teacher_model=['student']), policy)
+    with pytest.raises(ValueError, match='does not apply here'):
+        _check_distillation(RLConfig(rl_type='mopd', _teacher_use_disable_adapter=True), policy)
+    with pytest.raises(ValueError, match='heterogeneous teachers'):
+        _check_distillation(RLConfig(rl_type='mopd', teacher_model=['t'], teacher_model_type='qwen3'), policy)
+    # K distinct same-family teachers stay valid (teacher_model_type unset inherits the policy family).
+    _check_distillation(RLConfig(rl_type='mopd', teacher_model=['a', 'b'], lmbda=1.0), policy)
+
     from swift.dev.config.validate import _check_rlsd, _check_sdar, _check_self_distillation
     with pytest.raises(ValueError, match='orm channel'):
         _check_rlsd(RLConfig(rl_type='grpo', advantage_reweight='rlsd'))
@@ -284,6 +307,20 @@ def test_distillation_family_and_self_distill():
     with pytest.raises(ValueError, match='liger'):
         _check_self_distillation(RLConfig(rl_type='grpo', advantage_reweight='rlsd'),
                                  TrainConfig(use_liger_kernel=True), RewardConfig(orm=['accuracy']))
+
+
+def test_fsdp_dead_combinations_are_refused():
+    """S2-4x: --fsdp_config without --fsdp selects no strategy so the config is silently dead, and
+    --fsdp under --deepspeed loses the builder's if/elif resolution race; both are refused here."""
+    from swift.dev.config.validate import _check_fsdp_config
+
+    with pytest.raises(ValueError, match='only consumed together with --fsdp'):
+        _check_fsdp_config(DistributedConfig(fsdp_config={'reshard_after_forward': False}))
+    with pytest.raises(ValueError, match='not compatible with --deepspeed'):
+        _check_fsdp_config(DistributedConfig(fsdp='fsdp2', deepspeed='zero2'))
+    # The live combinations pass: fsdp alone, and both off.
+    _check_fsdp_config(DistributedConfig(fsdp='fsdp2', fsdp_config={'reshard_after_forward': False}))
+    _check_fsdp_config(DistributedConfig())
 
 
 def test_auxiliary_adapters_and_channel_companions():
@@ -453,6 +490,19 @@ def test_unsloth_strategy_refusals():
     _check_unsloth_strategy(DistributedConfig(backend='unsloth'), TemplateConfig())
 
 
+def test_unsloth_eval_refusals():
+    """S2-63: backend=unsloth refuses in-training evaluation: an eval forward between training
+    steps breaks the non-reentrant checkpoint recompute (CheckpointError, then DDP "Expected to
+    have finished reduction" on every step); upstream unslothai/unsloth#14063 family."""
+    with pytest.raises(NotImplementedError, match='in-training evaluation'):
+        _check_unsloth_eval(TrainConfig(eval_strategy='steps'), DistributedConfig(backend='unsloth'))
+    with pytest.raises(NotImplementedError, match='in-training evaluation'):
+        _check_unsloth_eval(TrainConfig(eval_on_start=True), DistributedConfig(backend='unsloth'))
+    _check_unsloth_eval(TrainConfig(eval_strategy='no', eval_on_start=False), DistributedConfig(backend='unsloth'))
+    _check_unsloth_eval(TrainConfig(), DistributedConfig(backend='unsloth'))
+    _check_unsloth_eval(TrainConfig(eval_strategy='steps', eval_on_start=True), DistributedConfig())
+
+
 def test_deepspeed_autotp_refused():
     """S2-43: DeepSpeed AutoTP has no TP-aware sampler on the twinkle strategy; refused rather
     than half-wired."""
@@ -484,6 +534,20 @@ def test_megatron_fsdp_config_gates():
         _check_megatron_fsdp(DistributedConfig(backend='megatron', use_megatron_fsdp=True,
                                                context_parallel_size=2), True)
     _check_megatron_fsdp(DistributedConfig(backend='megatron', use_megatron_fsdp=True), True)
+
+
+def test_cp_partition_mode_contiguous_is_rejected_for_training():
+    """S2-45b: only the checkpoint-repartition path honours contiguous CP; a training run would split
+    load-balanced (zigzag) while claiming contiguous, so it fails instead of silently diverging."""
+    from swift.dev.config.validate import _check_cp_partition_mode
+
+    contiguous = DistributedConfig(backend='megatron', context_parallel_size=2, cp_partition_mode='contiguous')
+    with pytest.raises(NotImplementedError, match='load-balanced'):
+        _check_cp_partition_mode(contiguous, True)
+    # cp=1 makes the mode inert, and the transformers backend never sees CP at all.
+    _check_cp_partition_mode(DistributedConfig(backend='megatron', cp_partition_mode='contiguous'), True)
+    _check_cp_partition_mode(contiguous, False)
+    _check_cp_partition_mode(DistributedConfig(backend='megatron', context_parallel_size=2), True)
 
 
 def test_megatron_recompute_and_attn_backend():
@@ -671,22 +735,22 @@ def test_rlhf_reference_and_layout_gates():
     without a ref model is refused; padding_free/packing is wired for most RLHF types (ppo/opsd/
     mopd refused with the reason); RL requires right padding (logp extraction)."""
     with pytest.raises(ValueError, match='ref_adapters requires'):
-        _check_rlhf_ref_model(ModelConfig(), None, RLConfig(rl_type='dpo', ref_adapters=['a']))
+        _check_rl_ref_model(ModelConfig(), None, RLConfig(rl_type='dpo', ref_adapters=['a']))
     with pytest.raises(ValueError, match='not used by rl_type'):
-        _check_rlhf_ref_model(ModelConfig(), TunerConfig(tuner='lora'),
+        _check_rl_ref_model(ModelConfig(), TunerConfig(tuner='lora'),
                               RLConfig(rl_type='cpo', ref_model='m'))
-    _check_rlhf_ref_model(ModelConfig(), None, RLConfig(rl_type='dpo', ref_model='m'))
+    _check_rl_ref_model(ModelConfig(), None, RLConfig(rl_type='dpo', ref_model='m'))
 
     for rl_type, message in (('ppo', 'value-head critic'), ('opsd', 'teacher->student'),
                              ('mopd', 'K teacher logps')):
         with pytest.raises(ValueError, match=message):
-            _check_rlhf_padding_free(TemplateConfig(padding_free=True), DatasetConfig(),
+            _check_rl_padding_free(TemplateConfig(padding_free=True), DatasetConfig(),
                                      RLConfig(rl_type=rl_type))
-    _check_rlhf_padding_free(TemplateConfig(padding_free=True), DatasetConfig(), RLConfig(rl_type='grpo'))
+    _check_rl_padding_free(TemplateConfig(padding_free=True), DatasetConfig(), RLConfig(rl_type='grpo'))
 
     with pytest.raises(ValueError, match='padding_side="right"'):
-        _check_rlhf_padding_side(TemplateConfig(padding_side='left'), RLConfig(rl_type='dpo'))
-    _check_rlhf_padding_side(TemplateConfig(padding_side='right'), RLConfig(rl_type='dpo'))
+        _check_rl_padding_side(TemplateConfig(padding_side='left'), RLConfig(rl_type='dpo'))
+    _check_rl_padding_side(TemplateConfig(padding_side='right'), RLConfig(rl_type='dpo'))
 
 
 def test_eval_and_logging_gates(monkeypatch):

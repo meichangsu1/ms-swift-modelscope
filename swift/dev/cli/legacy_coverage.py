@@ -12,6 +12,9 @@ UNSUPPORTED_SAMPLER_FIELDS: Tuple[str, ...] = (
 REMOVED_OPTION_FIELDS: Tuple[str, ...] = (
     'ignore_args_error', 'use_swift_lora', 'write_batch_size', 'to_ollama', 'orm_model', 'prm_model',
     'reward_model_plugin', 'custom_register_path', 'tuner_backend',
+    # enable_npu_model_patch is retired: the switch is platform-detected (on on NPU, off on
+    # torch_npu-less hosts); the v5 config layer sets SWIFT_ENABLE_NPU_MODEL_PATCH itself.
+    'enable_npu_model_patch',
     # device_map is retired: the runtime places the model through its own parallel/accelerate strategy.
     'device_map',
     # use_vllm is retired: a rollout always rides a weight-syncable sampler engine (--rollout_sampler).
@@ -27,13 +30,17 @@ REMOVED_OPTION_FIELDS: Tuple[str, ...] = (
     'adalora_beta1', 'adalora_beta2', 'adalora_orth_reg_weight',
     # The engine's LoRA machinery is owned by the adapters themselves: enable is automatic when
     # adapters are passed, and the rank budget is measured from each adapter_config.json.
-    'vllm_enable_lora', 'vllm_max_lora_rank')
+    'vllm_enable_lora', 'vllm_max_lora_rank', 'save_missing_weights',
+    # vllm_use_async_engine is retired: today's vLLM has no such engine arg (the async engine is
+    # chosen by the engine class), so the flag reached the engine as an unknown key and was dropped.
+    'vllm_use_async_engine')
 # Per-field replacement text where the migration path is specific enough to name.
 REMOVED_OPTION_REPLACEMENTS: Dict[str, str] = {
     'vllm_enable_lora': 'LoRA support is enabled automatically whenever adapters are passed (--adapters'
                         ' / --orm_adapters); drop this flag',
     'vllm_max_lora_rank': 'the rank budget is measured from each adapter\'s own adapter_config.json; '
                           'drop this flag',
+    'vllm_use_async_engine': 'the async engine is selected by the engine class itself; drop this flag',
     'orm_model': 'pass the reward-model id as an item of --orm instead',
     'prm_model': 'pass the reward-model id as an item of --prm instead',
     'reward_model': 'pass the reward-model id as an item of --orm instead',
@@ -73,6 +80,7 @@ REMOVED_OPTION_REPLACEMENTS: Dict[str, str] = {
     'preserve_thinking': 'thinking-block handling is configured through --enable_thinking; drop --preserve_thinking',
     'disable_ignore_empty_think': 'empty-think handling is not configurable; drop --disable_ignore_empty_think',
     'seq_kd': 'sequence-level knowledge distillation is expressed through the GKD objective; drop --seq_kd',
+    'save_missing_weights': 'conversion always saves missing weights; drop --save_missing_weights',
 }
 # eval scores a local sampler or a --eval_url endpoint through the native runner, so the remote
 # backend selector and the OpenCompass-only local-data toggle are obsolete.
@@ -112,6 +120,9 @@ SERVING_DISTRIBUTED_FIELDS: Tuple[str, ...] = UNSUPPORTED_DISTRIBUTED_FIELDS + (
 # Training consumes --ray_exp_name (twinkle.initialize) and --ddp_timeout (the strategy timeout); the
 # backend is fixed by the device platform and the layout is derived, so those two stay refused.
 TRAIN_UNSUPPORTED_DISTRIBUTED_FIELDS: Tuple[str, ...] = ('ddp_backend', 'device_groups')
+DECISION_AUGMENT_FIELDS: Tuple[str, ...] = (
+    'decision_drop_instructions', 'decision_subsample_options', 'decision_state_as_text', 'decision_shuffle_fields')
+ENTROPACK_FIELDS: Tuple[str, ...] = ('entropack_target_bpp', 'entropack_linear_type')
 TRAIN_UNSUPPORTED_FIELDS: Tuple[str, ...] = (
     'optim_target_modules', 'log_on_each_node', 'include_num_input_tokens_seen', 'log_level', 'log_level_replica',
     'project', 'trackio_space_id', 'trackio_bucket_id', 'trackio_static_space_id', 'eval_do_concat_batches',
@@ -122,7 +133,10 @@ TRAIN_UNSUPPORTED_FIELDS: Tuple[str, ...] = (
     # config, OOM batch halving, the ZeRO-3 gather, eval offload/precision. The last two are builtin now.
     'torch_compile', 'torch_compile_backend', 'torch_compile_mode', 'accelerator_config', 'auto_find_batch_size',
     'ds3_gather_for_generation', 'eval_accumulation_steps', 'bf16_full_eval', 'fp16_full_eval',
-    'average_tokens_across_devices', 'use_logits_to_keep')
+    'average_tokens_across_devices', 'use_logits_to_keep') + ENTROPACK_FIELDS + ('min_p',)
+# The decision augmentation knobs are LIVE DatasetConfig fields (builders.dataset._augment_configs
+# binds them into the preprocessor channel), and Decision.md documents them on `swift sft` -- they
+# stay unsupported only on the non-training commands, which never build a training dataset.
 # Training options retired because the current path already behaves that way or folds them into
 # another flag; each is refused with the migration note in REMOVED_OPTION_REPLACEMENTS.
 TRAIN_REMOVED_OPTION_FIELDS: Tuple[str, ...] = (
@@ -227,6 +241,8 @@ LEGACY_ALIASES: Dict[str, str] = {
     'bf16': 'torch_dtype',
     'fp16': 'torch_dtype',
     'response_length': 'max_completion_length',
+    # v4 sampling spelling of the infer reward knob; a same-owner rename, folded at argv level.
+    'prm_threshold': 'reward_threshold',
     'use_ray': 'mode',
     'sampler_engine': 'sampler',
     'infer_backend': 'sampler',
@@ -303,28 +319,33 @@ CLI_LEGACY_ONLY: Dict[str, Mapping[str, Tuple[str, ...]]] = {
         'unsupported_sampler': UNSUPPORTED_SAMPLER_FIELDS,
         # infer consumes the same two distributed knobs a training run does: its Ray sampling entry names
         # the session (--ray_exp_name -> twinkle.initialize); --ddp_timeout -> the strategy timeout env.
-        'unsupported_command': TRAIN_UNSUPPORTED_DISTRIBUTED_FIELDS + CHECKPOINT_NON_TRAINING_FIELDS,
+        'unsupported_command': TRAIN_UNSUPPORTED_DISTRIBUTED_FIELDS + CHECKPOINT_NON_TRAINING_FIELDS
+        + DECISION_AUGMENT_FIELDS + ENTROPACK_FIELDS + ('min_p',),
         'removed_option': REMOVED_OPTION_FIELDS + ('data_range',),
     },
     'deploy': {
         'unsupported_sampler': UNSUPPORTED_SAMPLER_FIELDS,
-        'unsupported_command': SERVING_DISTRIBUTED_FIELDS + CHECKPOINT_NON_TRAINING_FIELDS,
-        'removed_option': REMOVED_OPTION_FIELDS,
+        'unsupported_command': SERVING_DISTRIBUTED_FIELDS + CHECKPOINT_NON_TRAINING_FIELDS
+        + DECISION_AUGMENT_FIELDS + ENTROPACK_FIELDS + ('min_p',),
+        # The deploy server owns its request logging and level: neither flag reached ServerArgs
+        # when the fields existed, so they are retired with the dead fields.
+        'removed_option': REMOVED_OPTION_FIELDS + ('verbose', 'log_level'),
     },
     'eval': {
         'unsupported_sampler': UNSUPPORTED_SAMPLER_FIELDS,
         'unsupported_command': SERVING_DISTRIBUTED_FIELDS + CHECKPOINT_NON_TRAINING_FIELDS + EVAL_SERVING_FIELDS
-        + ('merge_lora',),
+        + DECISION_AUGMENT_FIELDS + ENTROPACK_FIELDS + ('min_p', 'merge_lora'),
         'removed_option': REMOVED_OPTION_FIELDS + EVAL_REMOTE_EVAL_FIELDS + GENERATION_OPTION_FIELDS,
     },
     'export': {
         'unsupported_command': UNSUPPORTED_DISTRIBUTED_FIELDS + CHECKPOINT_EXPORT_UNSUPPORTED_FIELDS
-        + GENERATION_OPTION_FIELDS,
+        + GENERATION_OPTION_FIELDS + DECISION_AUGMENT_FIELDS + ENTROPACK_FIELDS + ('min_p',),
         'removed_option': REMOVED_OPTION_FIELDS,
     },
     'merge': {
         'unsupported_command': SERVING_DISTRIBUTED_FIELDS + CHECKPOINT_MERGE_UNSUPPORTED_FIELDS
-        + QUANTIZE_OPERATION_FIELDS + CONVERT_OPERATION_FIELDS + GENERATION_OPTION_FIELDS + MERGE_IMPLICIT_FIELDS,
+        + QUANTIZE_OPERATION_FIELDS + CONVERT_OPERATION_FIELDS + GENERATION_OPTION_FIELDS + MERGE_IMPLICIT_FIELDS
+        + DECISION_AUGMENT_FIELDS + ENTROPACK_FIELDS + ('min_p',),
         'removed_option': REMOVED_OPTION_FIELDS,
     },
 }

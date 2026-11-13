@@ -8,6 +8,7 @@ from swift.dev.recipe.utils import (
     StepState,
     build_generative_eval,
     build_save_knobs,
+    collect,
     evaluate_generate,
     evaluate_loss,
     fit_supervised,
@@ -37,6 +38,21 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 
+def _is_vpp_megatron(distributed_config: "DistributedConfig") -> bool:
+    """Whether the active backend is megatron with virtual pipeline stages enabled."""
+    from swift.dev.builders import is_megatron_backend
+
+    return (is_megatron_backend(distributed_config)
+            and (distributed_config.virtual_pipeline_model_parallel_size or 1) > 1)
+
+
+#: Forward tasks whose eval must submit each dataloader batch as ONE whole forward: their
+#: labels live per record (decision) or one record expands into several sequences (embedding
+#: anchor+positives, reranker query+candidates), so the forward-only micro-batcher's
+#: sample-level split desynchronizes labels from logits.
+_WHOLE_BATCH_EVAL_TASKS = frozenset({'decision', 'embedding', 'reranker', 'generative_reranker'})
+
+
 class _Evaluation:
     def __init__(
         self,
@@ -50,6 +66,8 @@ class _Evaluation:
         manual_gc,
         manual_gc_eval,
         greater_is_better,
+        eval_group_size: int = 1,
+        packed_eval: bool = False,
     ):
         self.cluster, self.state, self.model = cluster, state, cluster.model
         self.generative, self.micro_step_fn = generative, micro_step_fn
@@ -59,7 +77,20 @@ class _Evaluation:
         self.eval_iters = train_config.eval_iters
         self.metric_for_best_model = train_config.metric_for_best_model
         self.greater_is_better = greater_is_better
-        self.micro_batch_size = train_config.per_device_eval_batch_size
+        # Tasks whose forward output is not one row per record: decision's labels/decision_meta
+        # are organized per RECORD (the forward-only readout guard raises on sample-level
+        # splits); embedding/reranker expand one record into anchor+candidate sequences, so the
+        # merged outputs' sample axis cannot match the micro-plan's record indices. A PACKED
+        # eval row is the same shape problem: one dataloader row is a group whose forward the
+        # processor unpacks into N per-sequence outputs, so any sample-level micro-plan
+        # desynchronizes from the merged logps' axis. All of these must run each batch whole --
+        # micro_batch_size=None disables micro-batching while per_device_eval_batch_size still
+        # governs the DataLoader.
+        if cluster.forward_task in _WHOLE_BATCH_EVAL_TASKS or packed_eval:
+            self.micro_batch_size = None
+        else:
+            self.micro_batch_size = train_config.per_device_eval_batch_size
+        self.eval_group_size = eval_group_size
         self.history = []
         self.best_step, self.best_ckpt, self.warned_eval_dp = 0, None, False
 
@@ -100,6 +131,7 @@ class _Evaluation:
                 micro_step_kwargs=self.micro_step_fn,
                 global_step=self.state.global_step,
                 micro_batch_size=self.micro_batch_size,
+                eval_group_size=self.eval_group_size,
             )
         if result is None:
             return None
@@ -142,12 +174,15 @@ def run_supervised(
     output_dir: str = "output",
     _save_final: bool = True,
     log_formatter: Optional[Callable[[dict, float], str]] = None,
+    wire_callbacks: Optional[Callable[[Any], None]] = None,
 ) -> List[dict]:
     """The supervised family's training main: resume, run the epochs, then the final save.
 
     Each entry assembles its cluster (:func:`build_supervised_objects`) and hands it here with its
     loss closure as ``micro_step_fn`` -- how a batch becomes forward kwargs. The loop scaffolding
     (:class:`StepState` cadence, eval + best-model tracking, save/resume) is this function's.
+    ``wire_callbacks`` runs once with the assembled ``CallbackHandler``, for task-specific wiring
+    the generic loop must not know about (the decision recipe binds its calibration callback).
     """
     from twinkle.perf import Perf
 
@@ -204,6 +239,8 @@ def run_supervised(
         log_formatter=log_formatter,
     )
     handler = state.handler
+    if wire_callbacks is not None:
+        wire_callbacks(handler)
 
     evaluation = _Evaluation(
         cluster,
@@ -215,6 +252,9 @@ def run_supervised(
         manual_gc=manual_gc,
         manual_gc_eval=manual_gc_eval,
         greater_is_better=greater_is_better,
+        eval_group_size=(max(1, train_config.gradient_accumulation_steps)
+                         if _is_vpp_megatron(distributed_config) else 1),
+        packed_eval=bool(dataset_config.packing),
     )
     evaluate = evaluation.evaluate
 
@@ -241,7 +281,11 @@ def run_supervised(
         handler.on_step_begin()
         # forward_backward / clip_grad_and_step carry @timed at their twinkle definition
         # site, so the span is recorded on the rank that actually runs them.
-        model.forward_backward(**micro_step_fn(samples, micro_batch_size=train_config.per_device_train_batch_size))
+        # Collect: an actor-side failure in forward_backward must fail THIS step, not surface later
+        # as a Ray background error while the driver keeps recording loss=0 and reports a fully
+        # failed run as success.
+        collect(model.forward_backward(
+            **micro_step_fn(samples, micro_batch_size=train_config.per_device_train_batch_size)))
         handler.on_pre_optimizer_step()
         model.clip_grad_and_step(max_grad_norm=state.max_grad_norm, gradient_accumulation_steps=1)
         handler.on_optimizer_step()

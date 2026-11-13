@@ -42,8 +42,8 @@ _mcore_017: Optional[bool] = None
 
 
 def _unwrap_models(models: List[Any]) -> List[Any]:
-    """Strip DDP/Float16Module wrappers (mcore-bridge's ``unwrap_model``), never the model itself."""
-    from mcore_bridge import unwrap_model
+    """Strip DDP/Float16Module wrappers (megatron core's ``unwrap_model``), never the model itself."""
+    from megatron.core.utils import unwrap_model
 
     return unwrap_model(models)
 
@@ -127,7 +127,14 @@ def _filter_adapter_state_dict(state_dict: Dict[str, Any], peft_format: bool, ad
         state_dict_model = state_dict[model_key]
         for k, v in state_dict_model.items():
             if peft_format:
-                if '.lora_A.' in k or '.lora_B.' in k or '.modules_to_save.' in k:
+                adapter_modules = ('lora_A', 'lora_B', 'modules_to_save')
+                if any(f'.{module}.' in k for module in adapter_modules):
+                    if adapter_name != 'default':
+                        # A PEFT checkpoint stores the adapter under the `default` slot while the target
+                        # model looks its tensors up under `adapter_name`. Only the READ key (`v.key`) is
+                        # remapped; the state-dict key stays as the model expects it.
+                        for module in adapter_modules:
+                            v.key = v.key.replace(f'.{module}.{adapter_name}.', f'.{module}.default.')
                     new_state_dict[k] = v
             else:
                 if '.lora_A.' in k or '.lora_B.' in k or 'original_module.' in k:
@@ -235,10 +242,16 @@ def load_mcore_dist_checkpoint(models: List[Any],
     checkpoint_dir = os.path.join(load_dir, f'iter_{iteration:07d}')
     state_dict = dist_checkpointing.load_common_state_dict(checkpoint_dir)
 
-    ckpt_tp_pp = (
-        state_dict['args'].tensor_model_parallel_size,
-        state_dict['args'].pipeline_model_parallel_size,
-    )
+    ckpt_args = state_dict.get('args')
+    if ckpt_args is None:
+        # Twinkle-saved megatron checkpoints carry no 'args' in the common state: the layout the
+        # sharded load needs lives in content_metadata, and there is nothing to compare here.
+        ckpt_tp_pp = None
+    else:
+        ckpt_tp_pp = (
+            ckpt_args.tensor_model_parallel_size,
+            ckpt_args.pipeline_model_parallel_size,
+        )
     run_tp_pp = (
         parallel_meta['tensor_model_parallel_size'],
         parallel_meta['pipeline_model_parallel_size'],

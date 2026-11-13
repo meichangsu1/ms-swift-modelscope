@@ -12,8 +12,10 @@ from .protocol import Function
 class HyV3PreviewAgentTemplate(BaseAgentTemplate):
     HYTK = ""
     tool_call_start = "<tool_calls>"
+    supports_tool_schema = True
 
-    def get_toolcall(self, response: str) -> List[Function]:
+    def get_toolcall(self, response: str, tools: Optional[List[Union[str, dict]]] = None) -> List[Function]:
+        tool_schemas = self._tool_schemas(tools)
         # Parse tool calls from <tool_calls>...<tool_call>name<tool_sep>...<arg_key>...<arg_value>...</tool_call>...
         tool_call_blocks = re.findall(rf"<tool_call{self.HYTK}>(.*?)</tool_call{self.HYTK}>", response, re.DOTALL)
         functions = []
@@ -29,12 +31,7 @@ class HyV3PreviewAgentTemplate(BaseAgentTemplate):
                 block,
                 re.DOTALL,
             )
-            arguments = {}
-            for k, v in pairs:
-                k = k.strip()
-                v = v.strip()
-                parsed = self._parse_json(v)
-                arguments[k] = parsed if parsed is not None else v
+            arguments = BaseAgentTemplate._decode_schema_args(pairs, tool_schemas, name)
             functions.append(Function(name=name, arguments=arguments))
         if len(functions) == 0:
             # compat react_en
@@ -61,8 +58,10 @@ class HyV3PreviewAgentTemplate(BaseAgentTemplate):
         with_action = self.keyword.action in assistant_content and self.keyword.action_input in assistant_content
         if with_action:
             return super()._format_tool_responses(assistant_content, tool_messages)
-        res = [f"<｜hy_eos{self.HYTK}｜>", self._get_tool_responses(tool_messages), f"<｜hy_Assistant{self.HYTK}｜>"]
-        return assistant_content, res
+        # the round separator and the next response opener are the engine's job (chat_sep /
+        # response_opener, both already carrying this family's eos and assistant markers); the
+        # merged tool turn only adds the tool responses block, as the official jinja does
+        return assistant_content, [self._get_tool_responses(tool_messages)]
 
     def _format_tools(self, tools: List[Union[str, dict]], system: Optional[str] = None, user_message=None) -> str:
         tool_descs = [json.dumps(self.wrap_tool(tool), ensure_ascii=False) for tool in tools]

@@ -38,6 +38,9 @@ class CosineReward(ORM):
         self.max_len_value_wrong = args.cosine_max_len_value_wrong
         self.min_len_value_correct = args.cosine_min_len_value_correct
         self.max_len_value_correct = args.cosine_max_len_value_correct
+        if args.cosine_max_len is None:
+            raise ValueError('The cosine reward requires cosine_max_len (process derives it from '
+                             'max_completion_length when unset).')
         self.max_len = args.cosine_max_len
         self.accuracy_orm = accuracy_orm or MathAccuracy()
 
@@ -59,7 +62,7 @@ class CosineReward(ORM):
                 min_value = self.max_len_value_wrong
                 max_value = self.min_len_value_wrong
             gen_len = len(trajectory.get('response_token_ids') or [])
-            rewards.append(self.cosfn(gen_len, self.max_len, min_value, max_value))
+            rewards.append(self.cosfn(min(gen_len, self.max_len), self.max_len, min_value, max_value))
         return rewards
 
 
@@ -96,7 +99,12 @@ class SoftOverlong(ORM):
 
     def __init__(self, args: Optional[Any] = None, **kwargs):
         super().__init__(args)
-        assert args.soft_cache_length < args.soft_max_length
+        if args.soft_cache_length is None or args.soft_max_length is None:
+            raise ValueError('The soft_overlong reward requires soft_cache_length and soft_max_length '
+                             '(process derives soft_max_length from max_completion_length when unset).')
+        if args.soft_cache_length >= args.soft_max_length:
+            raise ValueError(f'soft_cache_length ({args.soft_cache_length}) must be smaller than '
+                             f'soft_max_length ({args.soft_max_length}).')
         self.soft_max_length = args.soft_max_length
         self.soft_cache_length = args.soft_cache_length
 
@@ -106,7 +114,7 @@ class SoftOverlong(ORM):
             completion_length = len(trajectory.get('response_token_ids') or [])
             expected_len = self.soft_max_length - self.soft_cache_length
             exceed_len = completion_length - expected_len
-            rewards.append(min(-exceed_len / self.soft_cache_length, 0))
+            rewards.append(max(-1., min(-exceed_len / self.soft_cache_length, 0)))
         return rewards
 
 

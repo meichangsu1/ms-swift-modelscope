@@ -59,8 +59,6 @@ def parse_infer_configs(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         infer_config.batch_size = infer_config.num_sampling_batch_size
     if infer_config.num_sampling_batches is not None:
         infer_config.max_batches = infer_config.num_sampling_batches
-    if infer_config.prm_threshold is not None and 'reward_threshold' not in passed:
-        infer_config.reward_threshold = infer_config.prm_threshold
     if 'padding_side' not in passed:
         result['template_config'].padding_side = 'left'
     # num_samples (the CLI spelling) and num_return_sequences (the InferConfig field) are one knob under
@@ -120,7 +118,7 @@ def _guard_interactive(distributed_config: Any, task_type: Optional[str]) -> Non
     pass, and dp>1 would open competing REPLs (torchrun) or shard the batch (DP>1 sampler)."""
     from swift.dev.builders import is_pooling_task
     task_type = task_type or 'causal_lm'
-    if is_pooling_task(task_type) or task_type == 'generative_reranker':
+    if is_pooling_task(task_type) or task_type in ("generative_reranker", "decision"):
         raise ValueError(
             f'task_type={task_type!r} scores a forward pass, which the interactive REPL cannot drive (it '
             'only generates text). Run over a dataset (--dataset / --val_dataset) to score it.')

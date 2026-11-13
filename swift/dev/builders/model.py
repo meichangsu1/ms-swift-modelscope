@@ -110,6 +110,18 @@ def load_model_processor(model_config: ModelConfig, *, load_model: bool = False,
 
             processor = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
         pad_token_id = _normalize_pad_eos(processor)
+        # The encoding side must know the new tokens: the training constructors grow the model's
+        # own tokenizer on the worker, but the template/dataset tokenizer comes from HERE --
+        # without the addition, rows containing the new token text encode into subword ids and
+        # the new embedding rows never receive a real gradient (legacy added them to this same
+        # shared processor). The model-side resize stays with the constructors / the explicit
+        # ``apply_new_special_tokens`` twin.
+        new_special_tokens = resolve_new_special_tokens(model_config)
+        if new_special_tokens:
+            tokenizer = processor if not hasattr(processor, "tokenizer") else processor.tokenizer
+            num_new = tokenizer.add_special_tokens({"additional_special_tokens": new_special_tokens})
+            if num_new:
+                logger.info("Added %s new special tokens to the encoding processor.", num_new)
         processor.model_info = info
         candidate_templates = [template for template in (info.template,) if template]
         if not candidate_templates:
@@ -126,9 +138,14 @@ def load_model_processor(model_config: ModelConfig, *, load_model: bool = False,
         )
 
         model = None
+        # Classification attrs must land on the config regardless of load_model: the template's
+        # processor is loaded through this same seam with load_model=False, and its collators
+        # (one-hot width, problem_type dispatch) read config.problem_type / config.num_labels.
+        # Without this the multi-label collator falls to the single-label branch and BCE gets
+        # raw label indices shaped [B, len(indices)] instead of a one-hot [B, num_labels].
+        if info.task_type in ("seq_cls", "reranker"):
+            _prepare_seq_cls_config(config, model_config, info, pad_token_id)
         if load_model:
-            if info.task_type in ("seq_cls", "reranker"):
-                _prepare_seq_cls_config(config, model_config, info, pad_token_id)
             load_kwargs = dict(model_config.model_kwargs or {})
             # device_map has no default: it reaches from_pretrained only when a caller passes it
             # explicitly (merge's CPU load, quantize's 'auto' guard) or via model_kwargs.
@@ -192,6 +209,21 @@ def load_model_processor(model_config: ModelConfig, *, load_model: bool = False,
         return model, processor
 
 
+def _resolve_hf_attn_impl(attn_impl: Optional[str]) -> Optional[str]:
+    """Map dev's ``attn_impl`` alias to the spelling transformers' ``from_pretrained`` accepts.
+
+    ``flash_attn`` is dev's alias (and legacy v4's spelling) for transformers' ``flash_attention_2``;
+    the versioned ``flash_attention_3/4`` and the non-flash values (``eager``/``sdpa``/``flex_attention``)
+    are already valid transformers spellings and pass through unchanged. Both the config write
+    (``_postprocess_load_config``) and the explicit ``attn_implementation`` load kwarg must resolve it:
+    the kwarg overrides the config inside ``from_pretrained``, so leaving it raw makes transformers
+    reject the very alias ``_SP_PADDING_FREE_ATTN_IMPLS`` documents as valid.
+    """
+    if attn_impl in {"flash_attn", "flash_attention_2"}:
+        return "flash_attention_2"
+    return attn_impl
+
+
 def _postprocess_load_config(config, info, attn_impl) -> None:
     """The raw-load half of legacy ``ModelLoader._postprocess_config`` that ``_build_hf_config``
     does not already cover: inference-ignore keys, the resolved dtype (vision sub-configs
@@ -207,7 +239,7 @@ def _postprocess_load_config(config, info, attn_impl) -> None:
     HfConfigFactory.compat_zero3(config)
     if attn_impl:
         use_flash_attn = attn_impl in {"flash_attn", "flash_attention_2"}
-        resolved = "flash_attention_2" if use_flash_attn else attn_impl
+        resolved = _resolve_hf_attn_impl(attn_impl)
         for key in ("_attn_implementation", "attn_implementation", "llm_attn_implementation"):
             HfConfigFactory.set_config_attr(config, key, resolved, include_vit=True, ensure_set=False)
         for key in ("_flash_attn_2_enabled", "use_flash_attn", "_use_flash_attention_2"):
@@ -257,6 +289,13 @@ def _prepare_seq_cls_config(config, model_config: ModelConfig, info, pad_token_i
     config.tie_word_embeddings = False
     if getattr(config, "pad_token_id", None) is None:
         config.pad_token_id = pad_token_id
+        # HF's GenericForSequenceClassification reads get_text_config().pad_token_id, and a
+        # VL-style checkpoint (Qwen3.5 etc.) nests the text tower in text_config: setting only the
+        # top-level attribute leaves the nested one None and any batch_size > 1 forward raises
+        # "Cannot handle batch sizes > 1 if no padding token is defined".
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None and getattr(text_config, "pad_token_id", None) is None:
+            text_config.pad_token_id = pad_token_id
 
 
 def _dtype_kwarg_name() -> str:
@@ -468,6 +507,17 @@ def build_model(
     if model_config.model:
         from swift.dev.utils.hub import safe_snapshot_download
 
+        if model_config.model_type is None:
+            # Pin the family from the ORIGINAL id before it is lost to the snapshot dir: the CLI's
+            # _resolve_model already rewrote `model` to a hash-named snapshot path (which matches
+            # no registered id); the portable id rides on `_model_id_or_path`. Without pinning,
+            # downstream re-resolution (_resolve_model_loader in both backend builders) falls back
+            # to the generic family-less load -- which the decision task's head-attachment guard
+            # rejects.
+            from swift.dev.model.loader import match_model_type
+
+            model_ref = getattr(model_config, '_model_id_or_path', None) or model_config.model
+            model_config.model_type = match_model_type(model_ref)
         model_config.model = safe_snapshot_download(model_config.model, revision=model_config.model_revision)
     if is_megatron_backend(distributed_config):
         return _build_megatron_model(
@@ -660,7 +710,12 @@ def _apply_seq_cls_head(kwargs: dict, model_config: ModelConfig, config, model_l
                 model_config.model, revision=model_config.model_revision, trust_remote_code=True
             )
         tokenizer = processor if not hasattr(processor, "tokenizer") else processor.tokenizer
+        # Set on the text config too: HF's seq_cls forward reads get_text_config().pad_token_id,
+        # which is the nested text_config on VL-style checkpoints (see _prepare_seq_cls_config).
         config.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            text_config.pad_token_id = config.pad_token_id
     kwargs["model_cls"] = "AutoModelForSequenceClassification"
     kwargs["config"] = config
 
@@ -775,17 +830,20 @@ def _build_hf_config(model_config: ModelConfig, model_loader=None):
     rope_scaling mirrors legacy ``_init_rope_scaling``: names map to {'type': name}; a factor-less
     rope derives it from max_model_len / origin, and the budget (origin * factor) is served length.
     """
+    from swift.dev.utils import HfConfigFactory
+
     if model_loader is not None:
         config = model_loader.build_config(model_config.model, revision=model_config.model_revision)
         config = model_loader.process_config(config)
     else:
         from transformers import AutoConfig
 
-        config = AutoConfig.from_pretrained(
-            model_config.model, revision=model_config.model_revision, trust_remote_code=True
-        )
-
-    from swift.dev.utils import HfConfigFactory
+        config = HfConfigFactory.load_hf_config(
+            model_config.model, revision=model_config.model_revision, trust_remote_code=True)
+        if config is None:
+            config = AutoConfig.from_pretrained(
+                model_config.model, revision=model_config.model_revision, trust_remote_code=True
+            )
 
     rope_scaling = model_config.rope_scaling
     if isinstance(rope_scaling, str):
@@ -881,8 +939,10 @@ def apply_new_special_tokens(model, processor, config, new_special_tokens: List[
 
     The training side owns the canonical application (twinkle's TransformersModel / MegatronModel
     take ``new_special_tokens`` as a constructor argument); this is the twin for models loaded
-    outside those constructors (weight transforms), called explicitly by whoever needs it --
-    ``load_model_processor`` deliberately does not apply it on its own.
+    outside those constructors (weight transforms), called explicitly by whoever needs it.
+    ``load_model_processor`` already adds the tokens to its tokenizer (the encoding side);
+    the addition here is idempotent and the resize triggers whenever the embedding matrix
+    still trails the tokenizer, so call order between the two cannot drop the resize.
     """
     from swift.dev.utils import HfConfigFactory
 
@@ -890,9 +950,8 @@ def apply_new_special_tokens(model, processor, config, new_special_tokens: List[
         return
     tokenizer = processor if not hasattr(processor, "tokenizer") else processor.tokenizer
     num_new = tokenizer.add_special_tokens({"additional_special_tokens": list(new_special_tokens)})
-    if num_new <= 0:
-        return
-    logger.info("Added %s new special tokens.", num_new)
+    if num_new:
+        logger.info("Added %s new special tokens.", num_new)
     origin_vocab_size = HfConfigFactory.get_config_attr(config, "vocab_size")
     if origin_vocab_size is None or origin_vocab_size >= len(tokenizer):
         return
@@ -926,7 +985,7 @@ def _build_transformers_model(
     # torch_dtype is a Literal, so getattr always resolves; forward to from_pretrained.
     if model_config.torch_dtype:
         _set_load_kwarg(kwargs, "dtype", getattr(torch, model_config.torch_dtype))
-    _set_load_kwarg(kwargs, "attn_implementation", model_config.attn_impl)
+    _set_load_kwarg(kwargs, "attn_implementation", _resolve_hf_attn_impl(model_config.attn_impl))
     _set_load_kwarg(kwargs, "experts_implementation", model_config.experts_impl)
     _set_load_kwarg(kwargs, "revision", model_config.model_revision)
     _set_load_kwarg(kwargs, "max_memory", model_config.max_memory)
@@ -934,6 +993,13 @@ def _build_transformers_model(
     # Resolve a dev family loader and build the config once so caller overrides reach custom loaders.
     model_loader = _resolve_model_loader(model_config)
     hf_config = _build_hf_config(model_config, model_loader)
+    if model_loader is None:
+        # The download step rewrites ModelConfig.model to the cache dir, which matches no registered id.
+        # Without a loader, model_arch never reaches twinkle and freeze_vit / all-linear narrowing silently
+        # degrade, so re-resolve from the checkpoint's own model_type.
+        model_loader = _resolve_model_loader(dataclasses.replace(model_config, model_type=hf_config.model_type))
+        if model_loader is not None:
+            hf_config = _build_hf_config(model_config, model_loader)
     kwargs["config"] = hf_config
     # MoE aux loss: twinkle adds any `aux_loss` it finds to the training loss; HF only emits it with
     # output_router_logits on. Opt-in (0.0 default leaves the checkpoint's own config untouched).
@@ -952,9 +1018,44 @@ def _build_transformers_model(
     strategy = "accelerate"
     if distributed_config.deepspeed:
         strategy = "deepspeed"
-        kwargs["deepspeed_config"] = _resolve_deepspeed_config(distributed_config)
+        config = _resolve_deepspeed_config(distributed_config)
+        # The "auto" batch placeholders must be resolved before the strategy runs: neither HF
+        # Trainer (trainer_config_process) nor accelerate's dataloader-carrying prepare ever
+        # executes on this path, and a raw "auto" string crashes DeepSpeed's batch assertion
+        # (in ZeRO-3's zero.Init at model construction, or at Accelerator.prepare).
+        world = distributed_config.nproc_per_node or 1
+        micro_bs = (train_config.per_device_train_batch_size if train_config is not None else 1) or 1
+        ga = (train_config.gradient_accumulation_steps if train_config is not None else 1) or 1
+        for key, value in (('train_micro_batch_size_per_gpu', micro_bs),
+                           ('gradient_accumulation_steps', ga),
+                           ('train_batch_size', world * micro_bs * ga)):
+            if config.get(key) == 'auto':
+                config[key] = value
+        # ZeRO-3 bucket sizes: HF Trainer fills these "auto" values from config.hidden_size; a
+        # VL-style checkpoint nests it in text_config (PeftModel's .config never exposes it), so
+        # resolve them here from the resolved hidden size, using the same formula HF applies.
+        zero_opt = config.get('zero_optimization')
+        if isinstance(zero_opt, dict):
+            text_config = getattr(hf_config, 'text_config', None) or hf_config
+            hidden_size = getattr(text_config, 'hidden_size', None) or getattr(
+                getattr(text_config, 'text_config', None), 'hidden_size', None)
+            if hidden_size:
+                if zero_opt.get('reduce_bucket_size') == 'auto':
+                    zero_opt['reduce_bucket_size'] = hidden_size * hidden_size
+                if zero_opt.get('stage3_prefetch_bucket_size') == 'auto':
+                    zero_opt['stage3_prefetch_bucket_size'] = int(0.9 * hidden_size * hidden_size)
+                if zero_opt.get('stage3_param_persistence_threshold') == 'auto':
+                    zero_opt['stage3_param_persistence_threshold'] = 10 * hidden_size
+        kwargs["deepspeed_config"] = config
     elif distributed_config.fsdp:
         strategy = "native_fsdp"
+        # --fsdp_config (plus the JSON a --fsdp preset/path names) reaches the FSDP strategies only
+        # through this ctor kwarg: the native strategy reads reshard_after_forward / mixed_precision
+        # / manual_prefetch / expert_parallel, the accelerate strategy the FullyShardedDataParallelPlugin
+        # fields. Without this forwarding the whole field is silently dead.
+        from swift.dev.utils import resolve_fsdp_config
+
+        kwargs["fsdp_config"] = resolve_fsdp_config(distributed_config.fsdp, distributed_config.fsdp_config)
     kwargs["strategy"] = resolve_strategy(strategy)
     # The transformers strategies read the process-group timeout from this env var (not a ctor arg),
     # so --ddp_timeout reaches them through it; None leaves twinkle's own default.
@@ -1008,7 +1109,7 @@ def _build_transformers_model(
     model_framework = _resolve_model_framework(model_config, model_loader)
     if model_framework == "sentence_transformers":
         model = _build_sentence_transformer_model(
-            kwargs, model_config, distributed_config, tuner_config, quantize_config, train_config
+            kwargs, model_config, distributed_config, tuner_config, quantize_config, train_config, model_loader
         )
     elif model_framework is not None:
         # A declared framework with no builder here must fail loudly, not fall through as plain HF.
@@ -1017,6 +1118,8 @@ def _build_transformers_model(
         from swift.dev.model import UnslothModel
 
         _apply_unsloth_kwargs(kwargs, model_config, tuner_config, train_config, quantize_config)
+        if model_loader is not None:
+            kwargs["model_arch"] = _loader_model_arch(model_loader)
         model = UnslothModel(**kwargs)
     else:
         from swift.dev.builders.quantization import build_load_quantization_config
@@ -1037,14 +1140,7 @@ def _build_transformers_model(
             if train_config.gradient_checkpointing_kwargs:
                 kwargs["gradient_checkpointing_kwargs"] = train_config.gradient_checkpointing_kwargs
         if model_loader is not None:
-            arch = model_loader.model_arch
-            model_arch = {
-                part: list(getattr(arch, part, None) or []) for part in ("language_model", "vision_tower", "aligner")
-            }
-            lm_head = getattr(arch, "lm_head", None)
-            if lm_head:
-                model_arch["lm_head"] = lm_head
-            kwargs["model_arch"] = model_arch
+            kwargs["model_arch"] = _loader_model_arch(model_loader)
         if (
             train_config is not None
             and train_config.vit_gradient_checkpointing is not None
@@ -1068,15 +1164,10 @@ def _build_transformers_model(
             from twinkle.kernel import kernelize
             kernelize(model.model)
 
-    # twinkle's TransformersModel.__init__ calls gradient_checkpointing_enable() unconditionally
-    # (model/transformers/transformers.py), so the user's --gradient_checkpointing false was silently
-    # ignored -- and the find_unused_parameters derivation above already assumes the flag is honored,
-    # so the two disagreed. Turn it back off here when the config says so.
-    # NOTE: this is a post-hoc undo, not the right shape. The fix belongs upstream as a twinkle
-    # constructor argument (gradient_checkpointing=...); switch to passing it once that lands, so the
-    # model is never built in a state the caller did not ask for.
-    if train_config is not None and not train_config.gradient_checkpointing:
-        model.model.gradient_checkpointing_disable()
+    # gradient_checkpointing rides the TransformersModel ctor kwargs above (a kwarg twinkle gates
+    # worker-side, so --gradient_checkpointing false is honored under Ray too); the old post-hoc
+    # model.model.gradient_checkpointing_disable() undo is gone -- under Ray the driver-side proxy
+    # has no .model attribute, so it crashed exactly on the config it existed to honor.
 
     return model
 
@@ -1108,6 +1199,22 @@ def _has_sentence_transformer_layout(model_dir) -> bool:
     )
 
 
+def _loader_model_arch(model_loader) -> dict:
+    """The twinkle ``model_arch`` declaration (language_model / vision_tower / aligner / lm_head
+    module paths) of a resolved family loader, in the dict shape TransformersModel consumes.
+
+    model_arch drives twinkle's multimodal 'all-linear' narrowing (freeze_vit / freeze_aligner /
+    freeze_llm) and the frozen-tower no-autograd patch; without it those silently degrade and LoRA
+    lands on every linear in the model, vision tower included.
+    """
+    arch = model_loader.model_arch
+    model_arch = {part: list(getattr(arch, part, None) or []) for part in ("language_model", "vision_tower", "aligner")}
+    lm_head = getattr(arch, "lm_head", None)
+    if lm_head:
+        model_arch["lm_head"] = lm_head
+    return model_arch
+
+
 def _build_sentence_transformer_model(
     kwargs: dict,
     model_config: ModelConfig,
@@ -1115,6 +1222,7 @@ def _build_sentence_transformer_model(
     tuner_config: Optional[TunerConfig],
     quantize_config: Optional[QuantizeConfig],
     train_config: Optional[TrainConfig],
+    model_loader=None,
 ) -> TrainableModel:
     """Construct a SentenceTransformerModel from the shared transformers-build kwargs.
 
@@ -1166,6 +1274,25 @@ def _build_sentence_transformer_model(
         "mixed_precision": kwargs["mixed_precision"],
         "ddp_config": kwargs.get("ddp_config"),
     }
+    # The loader is the authority on trust_remote_code for the ST backbone build: the base
+    # SentenceTransformerModel takes no model_loader, so thread the resolved flag through
+    # sentence_transformer_kwargs. gte-Qwen2's loader declares False -- its bundled modeling_qwen.py is a
+    # stale 4.41-era copy reading config.rope_theta (migrated into rope_parameters and dropped in
+    # transformers 5.x), so the native Qwen2Model must build the backbone. With no loader (an on-disk ST
+    # checkpoint of an unregistered family) the flag is left unset and _build_sentence_transformer's True
+    # default stands, since such a checkpoint may still ship remote code it needs.
+    if model_loader is not None:
+        st_kwargs["sentence_transformer_kwargs"] = {
+            "trust_remote_code": getattr(model_loader, "trust_remote_code", True)
+        }
+        # The loader's model_arch (language_model / vision_tower / aligner) drives twinkle's all-linear
+        # narrowing and the frozen-tower patch; forward it exactly as the plain transformers build does,
+        # else _patch_frozen_towers reads an unset attribute and all-linear LoRA lands on every linear.
+        st_kwargs["model_arch"] = _loader_model_arch(model_loader)
+    # --fsdp selects the FSDP strategy on the ST path too (the deepspeed guard above points here),
+    # so its config rides the same shared-kwarg forwarding.
+    if kwargs.get("fsdp_config") is not None:
+        st_kwargs["fsdp_config"] = kwargs["fsdp_config"]
     # ST never sees the shared kwargs, so thread the gradient-checkpointing flag straight through.
     if train_config is not None:
         st_kwargs["gradient_checkpointing"] = train_config.gradient_checkpointing
@@ -1340,7 +1467,6 @@ def build_parallel_mesh(distributed_config: Optional[DistributedConfig], *, none
 
 _NON_MODEL_MEGATRON_FIELDS = {
     "data_parallel_random_init",
-    "skip_megatron_init",
     "manual_gc",
     "manual_gc_eval",
     "manual_gc_steps",
@@ -1362,6 +1488,35 @@ def _field_was_requested(config, field_name: str) -> bool:
     else:
         return True
     return getattr(config, field_name) != default
+
+
+def _drop_unsupported_bridge_kwargs(kwargs: dict, bridge_backend: str) -> dict:
+    """Drop Megatron options the installed bridge's ``ModelConfig`` does not accept.
+
+    A bare default may be dropped; an option the user asked for explicitly raises, so it cannot
+    silently do nothing.
+    """
+    if bridge_backend != 'mcore-bridge':
+        return kwargs
+    import inspect
+    try:
+        from mcore_bridge import ModelConfig
+    except Exception:
+        return kwargs
+    parameters = inspect.signature(ModelConfig.__init__).parameters
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return kwargs
+    dropped = [name for name in kwargs if name != '_strict_model_kwargs' and name not in parameters]
+    if not dropped:
+        return kwargs
+    requested = sorted(set(kwargs.get('_strict_model_kwargs', ())).intersection(dropped))
+    if requested:
+        raise ValueError(f'{requested} are not accepted by the installed bridge ModelConfig: the installed '
+                         'mcore-bridge/megatron-core is too old. Upgrade them, or drop these options.')
+    for name in dropped:
+        kwargs.pop(name)
+    logger.info(f'Dropped Megatron options the installed bridge does not expose: {sorted(dropped)}')
+    return kwargs
 
 
 def _megatron_model_kwargs(megatron_config: Optional[MegatronConfig], moe_config: Optional[MoEConfig]) -> dict:
@@ -1438,7 +1593,8 @@ def _build_megatron_model(
         "use_distributed_optimizer": distributed_config.use_distributed_optimizer,
         "align_grad_reduce": distributed_config.align_grad_reduce,
         "nccl_comm_warmup": distributed_config.nccl_comm_warmup,
-        **_megatron_model_kwargs(megatron_config, moe_config),
+        **_drop_unsupported_bridge_kwargs(
+            _megatron_model_kwargs(megatron_config, moe_config), distributed_config.bridge_backend),
     }
     strict_model_kwargs = set(extra_kwargs.pop("_strict_model_kwargs", ()))
     # ModelParallelConfig/TransformerConfig fields owned by DistributedConfig; the spelling
@@ -1523,6 +1679,24 @@ def _build_megatron_model(
             if model_config.num_labels is None:
                 raise ValueError('ModelConfig.num_labels is required for task_type="seq_cls".')
             extra_kwargs["num_labels"] = model_config.num_labels
+    elif task_type == "decision":
+        # The dev family loader owns the readout head (mcore-bridge builds none); ship its
+        # (module, class) NAME -- a built nn.Module cannot cross the Ray boundary -- so the
+        # worker replays the build and attaches the head to the last-PP chunk
+        # (MegatronModel._attach_task_head). Branch-isolation / direct-backbone families raise
+        # here, at build time, before Ray starts.
+        from swift.dev.model.loader.decision import ScoringLoader
+
+        if not isinstance(model_loader, ScoringLoader):
+            raise ValueError(
+                f'--backend megatron with task_type="decision" needs a decision family loader; '
+                f"model_type={model_config.model_type!r} resolved {model_loader!r}."
+            )
+        # VPP is fine here: `is_last_pp` is judged per chunk (is_pipeline_last_stage(False,
+        # vp_stage) requires vp_stage == vpp-1 AND the last PP rank), and `carries_task_head`
+        # checks THIS chunk's task_head attribute -- the non-last virtual chunks fail both gates
+        # and fall through to the hidden-states pass-through the interleaving schedule expects.
+        extra_kwargs["task_head_loader"] = model_loader.task_head_loader()
 
     for name in ("vit_attn_impl", "language_model_only"):
         value = getattr(model_config, name)
