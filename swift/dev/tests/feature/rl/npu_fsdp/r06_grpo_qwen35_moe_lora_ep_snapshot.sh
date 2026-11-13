@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # R06: FSDP4 + EP2 + EP-FSDP2, vLLM TP4; eight NPUs total.
-# Adapter paths are published; weight_sync_backend is deliberately omitted.
+# Publish full model weights with LoRA merged through the checkpoint manager.
+# The historical filename is retained; this no longer tests adapter snapshot publication.
 # The source-rank loading and retained pre-EP snapshot require sufficient host RAM.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +18,7 @@ run_case \
     --rollout_sampler vllm --vllm_tensor_parallel_size 4 \
     --vllm_gpu_memory_utilization 0.5 --vllm_max_model_len 2048 \
     --sampler_mode disaggregated \
-    --async_mode fully_async --max_staleness 1 --allow_partial_rollout false \
+    --async_mode fully_async --max_staleness 1 \
     --rollout_importance_sampling_mode token_truncate \
-    --weight_sync_strategy adapter_snapshot \
+    --weight_sync_backend full \
     "$@"

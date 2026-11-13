@@ -85,7 +85,7 @@ run_case() {
         --model "$MODEL_PATH"
         --dataset "$DATASET_PATH"
         --mode ray --backend hf
-        --fsdp full_shard
+        --fsdp fsdp2
         --torch_dtype bfloat16
         --attn_impl sdpa
         --gradient_checkpointing true
