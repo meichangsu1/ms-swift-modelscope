@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full GRPO, native FSDP2 on four NPUs; two TP2 rollout replicas share those NPUs.
+# Async Full GRPO: FSDP2 on two NPUs, one TP2 rollout replica on two other NPUs.
 set -euo pipefail
 BENCHMARK_FRAMEWORK=swift
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
@@ -17,14 +17,14 @@ run_benchmark "$PYTHON_BIN" -m swift.dev.cli.rl \
     --mode ray \
     --backend hf \
     --fsdp fsdp2 \
-    --parallel_spec fsdp4 \
-    --nproc_per_node 4 \
+    --parallel_spec fsdp2 \
+    --nproc_per_node 2 \
     --torch_dtype bfloat16 \
     --attn_impl sdpa \
     --fsdp_config '{"mixed_precision":{"param_dtype":"bf16","reduce_dtype":"fp32","output_dtype":"bf16"}}' \
     --gradient_checkpointing true \
     --per_device_train_batch_size 2 \
-    --gradient_accumulation_steps 16 \
+    --gradient_accumulation_steps 32 \
     --generation_batch_size 32 \
     --num_generations 4 \
     --num_iterations 1 \
@@ -41,6 +41,8 @@ run_benchmark "$PYTHON_BIN" -m swift.dev.cli.rl \
     --orm accuracy \
     --dynamic_sample false \
     --overlong_filter false \
+    --rollout_importance_sampling_mode token_truncate \
+    --rollout_importance_sampling_threshold 2.0 \
     --log_rollout_offpolicy_metrics false \
     --log_completions false \
     --enable_thinking false \
@@ -49,20 +51,21 @@ run_benchmark "$PYTHON_BIN" -m swift.dev.cli.rl \
     --temperature 1 \
     --top_p 1 \
     --top_k -1 \
-    --sampler_mode colocate \
+    --sampler_mode disaggregated \
     --rollout_sampler vllm \
-    --async_mode none \
+    --async_mode fully_async \
+    --max_staleness "$MAX_STALENESS" \
     --weight_sync_backend full \
     --parameter_sync_step 1 \
     --vllm_tensor_parallel_size 2 \
-    --vllm_data_parallel_size 2 \
+    --vllm_data_parallel_size 1 \
     --vllm_gpu_memory_utilization "$ROLLOUT_MEMORY_FRACTION" \
     --vllm_enforce_eager true \
     --vllm_enable_prefix_caching true \
     --vllm_max_model_len 2560 \
     --vllm_max_num_seqs 32 \
-    --vllm_engine_kwargs "{\"seed\":$SEED,\"generation_config\":\"vllm\",\"max_num_batched_tokens\":8192,\"enable_chunked_prefill\":true}" \
-    --sleep_level 1 \
+    --vllm_engine_kwargs "{\"seed\":$SEED,\"generation_config\":\"vllm\",\"max_num_batched_tokens\":8192,\"enable_chunked_prefill\":true,\"additional_config\":{\"rl_config\":{\"enabled\":true}}}" \
+    --sleep_level 0 \
     --offload_model false \
     --offload_optimizer false \
     --optim adamw_torch \

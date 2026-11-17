@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared settings for the four-NPU Swift / verl comparison. Source from a launcher.
+# Shared settings: two training NPUs plus two rollout NPUs. Source from a launcher.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,6 +11,11 @@ MODEL_PATH="${MODEL_PATH:-/nas/disk1/Qwen3-4B}"
 DATA_DIR="${DATA_DIR:-$SCRIPT_DIR/data}"
 NPU_DEVICES="${NPU_DEVICES:-${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3}}"
 MAX_STEPS="${MAX_STEPS:-100}"
+MAX_STALENESS="${MAX_STALENESS:-1}"
+if [[ ! "$MAX_STALENESS" =~ ^[1-9][0-9]*$ ]]; then
+    echo 'MAX_STALENESS must be a positive integer.' >&2
+    exit 1
+fi
 SEED="${SEED:-42}"
 ROLLOUT_MEMORY_FRACTION="${ROLLOUT_MEMORY_FRACTION:-0.5}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
@@ -46,10 +51,13 @@ if int(steps) <= 0 or int(steps) * 32 > manifest['train']['kept']:
 for name in ('swift_train.jsonl', 'verl_train.parquet', 'verl_test.parquet'):
     if not (Path(data) / name).is_file():
         raise FileNotFoundError(f'Run prepare_data.py first: missing {name}')
-print(f'NPU devices: {devices}; model: {model}; steps: {steps}; response GBS: 128', flush=True)
+print(f'NPU devices: {devices}; training: 2; rollout: 2 (TP2); model: {model}; '
+      f'steps: {steps}; response GBS: 128', flush=True)
 PY
     mkdir -p "$RUN_DIR"
     {
+        printf 'framework=%s; training_npus=2; rollout_npus=2; max_staleness=%s\n' \
+            "$BENCHMARK_FRAMEWORK" "$MAX_STALENESS"
         for repo in "$SWIFT_DIR" "$TWINKLE_DIR" "$VERL_DIR"; do
             if [[ -d "$repo/.git" || -f "$repo/.git" ]]; then
                 git -C "$repo" log -1 --format='%H %s'

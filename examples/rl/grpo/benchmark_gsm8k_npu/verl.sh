@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full GRPO, FSDP2 on four NPUs; TP2 gives two rollout replicas, each with engine DP=1.
+# Async Full GRPO: FSDP2 on two NPUs, one TP2 rollout replica on two other NPUs.
 set -euo pipefail
 BENCHMARK_FRAMEWORK=verl
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
@@ -10,9 +10,11 @@ run_benchmark "$PYTHON_BIN" -m verl.trainer.main_ppo \
     algorithm.norm_adv_by_std_in_grpo=true \
     algorithm.use_kl_in_reward=false \
     algorithm.filter_groups.enable=false \
-    algorithm.rollout_correction.bypass_mode=true \
+    algorithm.rollout_correction.bypass_mode=false \
     algorithm.rollout_correction.loss_type=ppo_clip \
-    algorithm.rollout_correction.rollout_is=null \
+    algorithm.rollout_correction.rollout_is=token \
+    algorithm.rollout_correction.rollout_is_threshold=2.0 \
+    algorithm.rollout_correction.rollout_is_batch_normalize=false \
     algorithm.rollout_correction.rollout_rs=null \
     "data.train_files=$DATA_DIR/verl_train.parquet" \
     "data.val_files=$DATA_DIR/verl_test.parquet" \
@@ -25,6 +27,7 @@ run_benchmark "$PYTHON_BIN" -m verl.trainer.main_ppo \
     data.shuffle=false \
     "data.seed=$SEED" \
     '+data.apply_chat_template_kwargs.enable_thinking=false' \
+    actor_rollout_ref.hybrid_engine=false \
     "actor_rollout_ref.model.path=$MODEL_PATH" \
     actor_rollout_ref.model.lora_rank=0 \
     actor_rollout_ref.model.use_remove_padding=false \
@@ -64,6 +67,8 @@ run_benchmark "$PYTHON_BIN" -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
+    actor_rollout_ref.rollout.nnodes=1 \
+    actor_rollout_ref.rollout.n_gpus_per_node=2 \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.data_parallel_size=1 \
@@ -72,7 +77,7 @@ run_benchmark "$PYTHON_BIN" -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enforce_eager=true \
     actor_rollout_ref.rollout.enable_prefix_caching=true \
     actor_rollout_ref.rollout.enable_chunked_prefill=true \
-    actor_rollout_ref.rollout.free_cache_engine=true \
+    actor_rollout_ref.rollout.free_cache_engine=false \
     actor_rollout_ref.rollout.max_model_len=2560 \
     actor_rollout_ref.rollout.max_num_seqs=32 \
     actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
@@ -84,14 +89,20 @@ run_benchmark "$PYTHON_BIN" -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.top_k=-1 \
     "actor_rollout_ref.rollout.seed=$SEED" \
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.generation_config=vllm' \
+    '+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.rl_config.enabled=true' \
     actor_rollout_ref.rollout.checkpoint_engine.backend=nccl \
     "reward.custom_reward_function.path=$SCRIPT_DIR/shared_reward.py" \
     reward.custom_reward_function.name=compute_score \
     trainer.use_v1=true \
-    trainer.v1.trainer_mode=sync \
+    trainer.v1.trainer_mode=separate_async \
+    trainer.v1.separate_async.parameter_sync_step=1 \
+    trainer.v1.separate_async.num_warmup_batches=1 \
+    trainer.v1.separate_async.hybrid_rollout.enable_switch=false \
+    "trainer.v1.sampler.max_off_policy_threshold=$((MAX_STALENESS + 1))" \
+    trainer.v1.sampler.max_off_policy_strategy=drop \
     trainer.device=npu \
     trainer.nnodes=1 \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=2 \
     trainer.balance_batch=false \
     trainer.total_epochs=1 \
     "trainer.total_training_steps=$MAX_STEPS" \
