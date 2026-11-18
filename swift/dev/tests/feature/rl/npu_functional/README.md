@@ -111,9 +111,20 @@ python3 -m pytest -q tests/infra/test_resource_manager.py
 脚本支持 `MODEL_PATH` 覆盖某一个模型的实际目录，`TWINKLE_DIR` 指向配套源码，
 `PYTHON_BIN` 指定镜像中的 Python，以及 `MAX_STEPS`、`RUN_TAG`、`OUTPUT_ROOT`、
 `MAX_COMPLETION_LENGTH`、`MAX_LENGTH`、`ROLLOUT_MEMORY_FRACTION`。
+`OPTIM` 可选择优化器，默认 `adamw_torch`；`OPTIM_ARGS` 可传入优化器的额外参数。
 同一 shell 中不要对所有用例统一设置 `MODEL_PATH`，否则会覆盖矩阵里的不同模型。
 脚本末尾可追加尚未出现的 CLI 参数；当前 CLI 会拒绝同一参数的不同值重复出现，
 已有配置请通过上述环境变量或修改对应 case 文件调整。实际完整命令以 `command.txt` 为准。
+
+如果 R07 在创建 Adam 状态时显存不足，可临时使用无动量 SGD 验证 Full＋EP8 功能链路：
+
+```bash
+NPU_DEVICES=2,3,4,5,6,7,8,9 OPTIM=sgd OPTIM_ARGS=momentum=0 \
+bash swift/dev/tests/feature/rl/npu_functional/r07_grpo_qwen3_moe_full_ep_colocate.sh
+```
+
+此时记录的优化器为 SGD，不能作为原 Adam 配置通过的证据，也不用于 Adam 的效果或性能对比。
+不要在脚本末尾追加 `--optim sgd`：脚本已传入 `--optim`，CLI 会拒绝不同值的重复参数。
 
 仅检查要运行的命令（不检查 NPU、模型、数据，也不会启动训练）：
 

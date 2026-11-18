@@ -11,6 +11,8 @@ MODEL_PATH="${MODEL_PATH:-$MODEL_ROOT/$MODEL_NAME}"
 DATASET_PATH="${DATASET_PATH:-$SWIFT_DIR/examples/rl/grpo/benchmark_gsm8k_npu/data/swift_train.jsonl}"
 MAX_STEPS="${MAX_STEPS:-8}"
 SAVE_STEPS="${SAVE_STEPS:-$((MAX_STEPS + 1))}"
+OPTIM="${OPTIM:-adamw_torch}"
+OPTIM_ARGS="${OPTIM_ARGS:-}"
 SP_SIZE="${SP_SIZE:-1}"
 ALGORITHM="${ALGORITHM:-grpo}"
 SYNC_BACKEND="${SYNC_BACKEND:-full}"
@@ -64,12 +66,15 @@ run_case() {
         --sampler_mode "$DEPLOYMENT" --rollout_sampler "$SAMPLER"
         --async_mode "$ASYNC_MODE" --weight_sync_backend "$SYNC_BACKEND"
         --parameter_sync_step "$SYNC_INTERVAL"
-        --optim adamw_torch --learning_rate 1e-6 --lr_scheduler constant
+        --optim "$OPTIM" --learning_rate 1e-6 --lr_scheduler constant
         --weight_decay 0 --max_grad_norm 1 --num_train_epochs 1 --max_steps "$MAX_STEPS"
         --seed 42 --save_strategy steps --save_steps "$SAVE_STEPS"
         --eval_strategy no --logging_steps 1 --report_to tensorboard
         --logging_dir "$RUN_DIR/tensorboard" --output_dir "$RUN_DIR"
     )
+    if [[ -n "$OPTIM_ARGS" ]]; then
+        command+=(--optim_args "$OPTIM_ARGS")
+    fi
     if [[ "$TUNER" == lora ]]; then
         command+=(--lora_rank 8 --lora_alpha 32 --target_modules all-linear)
     fi
