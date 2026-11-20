@@ -20,17 +20,19 @@ run_benchmark "$PYTHON_BIN" -m swift.dev.cli.rl \
     --parallel_spec fsdp2 \
     --nproc_per_node 2 \
     --torch_dtype bfloat16 \
-    --attn_impl sdpa \
+    --attn_impl "$ATTN_IMPL" \
     --fsdp_config '{"mixed_precision":{"param_dtype":"bf16","reduce_dtype":"fp32","output_dtype":"bf16"}}' \
-    --gradient_checkpointing true \
-    --per_device_train_batch_size 2 \
-    --gradient_accumulation_steps 32 \
+    --gradient_checkpointing "$GRADIENT_CHECKPOINTING" \
+    --per_device_train_batch_size "$TRAIN_MICRO_BATCH_SIZE" \
+    --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
     --generation_batch_size 32 \
     --num_generations 4 \
     --num_iterations 1 \
-    --dynamic_batching false \
-    --dp_balance false \
-    --padding_free false \
+    --dynamic_batching "$DYNAMIC_BATCHING" \
+    --max_tokens_per_micro_batch "$TRAIN_MAX_TOKENS_PER_GPU" \
+    --packing_algorithm ffd \
+    --dp_balance "$DP_BALANCE" \
+    --padding_free "$PADDING_FREE" \
     --loss_type grpo \
     --scale_rewards group \
     --epsilon 0.2 \
@@ -60,11 +62,11 @@ run_benchmark "$PYTHON_BIN" -m swift.dev.cli.rl \
     --vllm_tensor_parallel_size 2 \
     --vllm_data_parallel_size 1 \
     --vllm_gpu_memory_utilization "$ROLLOUT_MEMORY_FRACTION" \
-    --vllm_enforce_eager true \
+    --vllm_enforce_eager "$VLLM_ENFORCE_EAGER" \
     --vllm_enable_prefix_caching true \
     --vllm_max_model_len 2560 \
-    --vllm_max_num_seqs 32 \
-    --vllm_engine_kwargs "{\"seed\":$SEED,\"generation_config\":\"vllm\",\"max_num_batched_tokens\":8192,\"enable_chunked_prefill\":true,\"additional_config\":{\"rl_config\":{\"enabled\":true}}}" \
+    --vllm_max_num_seqs "$ROLLOUT_MAX_NUM_SEQS" \
+    --vllm_engine_kwargs "{\"seed\":$SEED,\"generation_config\":\"vllm\",\"max_num_batched_tokens\":$ROLLOUT_MAX_NUM_BATCHED_TOKENS,\"enable_chunked_prefill\":true,\"compilation_config\":$VLLM_COMPILATION_CONFIG,\"additional_config\":{\"rl_config\":{\"enabled\":true}}}" \
     --sleep_level 0 \
     --offload_model false \
     --offload_optimizer false \

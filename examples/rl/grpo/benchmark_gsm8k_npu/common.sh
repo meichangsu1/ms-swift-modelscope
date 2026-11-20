@@ -17,10 +17,82 @@ if [[ ! "$MAX_STALENESS" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 SEED="${SEED:-42}"
-ROLLOUT_MEMORY_FRACTION="${ROLLOUT_MEMORY_FRACTION:-0.5}"
+BENCHMARK_PROFILE="${BENCHMARK_PROFILE:-optimized}"
+case "$BENCHMARK_PROFILE" in
+    optimized)
+        DYNAMIC_BATCHING="${DYNAMIC_BATCHING:-true}"
+        DP_BALANCE="${DP_BALANCE:-true}"
+        PADDING_FREE="${PADDING_FREE:-true}"
+        VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-false}"
+        ROLLOUT_MEMORY_FRACTION="${ROLLOUT_MEMORY_FRACTION:-0.8}"
+        ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-128}"
+        ;;
+    baseline)
+        DYNAMIC_BATCHING="${DYNAMIC_BATCHING:-false}"
+        DP_BALANCE="${DP_BALANCE:-false}"
+        PADDING_FREE="${PADDING_FREE:-false}"
+        VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-true}"
+        ROLLOUT_MEMORY_FRACTION="${ROLLOUT_MEMORY_FRACTION:-0.5}"
+        ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-32}"
+        ;;
+    *) echo 'BENCHMARK_PROFILE must be optimized or baseline.' >&2; exit 1 ;;
+esac
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
+TRAIN_MAX_TOKENS_PER_GPU="${TRAIN_MAX_TOKENS_PER_GPU:-8192}"
+ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-8192}"
+for setting in DYNAMIC_BATCHING DP_BALANCE PADDING_FREE VLLM_ENFORCE_EAGER GRADIENT_CHECKPOINTING; do
+    case "${!setting}" in
+        true|false) ;;
+        *) echo "$setting must be true or false." >&2; exit 1 ;;
+    esac
+done
+if [[ "$PADDING_FREE" == true ]]; then
+    ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
+else
+    ATTN_IMPL="${ATTN_IMPL:-sdpa}"
+fi
+if [[ "$DYNAMIC_BATCHING" == true ]]; then
+    # Twinkle's dynamic planner also enforces a row cap. Let the token budget set
+    # the actual micro-batches, while keeping 64 responses per rank per update.
+    TRAIN_MICRO_BATCH_SIZE="${TRAIN_MICRO_BATCH_SIZE:-64}"
+else
+    TRAIN_MICRO_BATCH_SIZE="${TRAIN_MICRO_BATCH_SIZE:-2}"
+fi
+for setting in TRAIN_MICRO_BATCH_SIZE TRAIN_MAX_TOKENS_PER_GPU ROLLOUT_MAX_NUM_SEQS ROLLOUT_MAX_NUM_BATCHED_TOKENS; do
+    if [[ ! "${!setting}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "$setting must be a positive integer." >&2
+        exit 1
+    fi
+done
+if (( TRAIN_MICRO_BATCH_SIZE > 64 || 64 % TRAIN_MICRO_BATCH_SIZE != 0 )); then
+    echo 'TRAIN_MICRO_BATCH_SIZE must divide 64 to preserve the response GBS of 128.' >&2
+    exit 1
+fi
+if [[ "$DYNAMIC_BATCHING" == true ]] && (( TRAIN_MAX_TOKENS_PER_GPU < 2560 )); then
+    echo 'TRAIN_MAX_TOKENS_PER_GPU must cover the maximum prompt + response length (2560).' >&2
+    exit 1
+fi
+GRADIENT_ACCUMULATION_STEPS="$((64 / TRAIN_MICRO_BATCH_SIZE))"
+# Capture a small set of decode sizes to limit Ascend graph/notify resources.
+# Prefill is not captured; graph sizes never exceed the configured sequence limit.
+VLLM_COMPILATION_CONFIG='{}'
+VERL_GRAPH_ARGS=()
+if [[ "$VLLM_ENFORCE_EAGER" == false ]]; then
+    graph_sizes=1
+    for size in 2 4 8 16 32 64 128; do
+        if (( size <= ROLLOUT_MAX_NUM_SEQS )); then
+            graph_sizes+=",$size"
+        fi
+    done
+    VLLM_COMPILATION_CONFIG="{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[$graph_sizes]}"
+    VERL_GRAPH_ARGS=(
+        '+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=FULL_DECODE_ONLY'
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_capture_sizes=[$graph_sizes]"
+    )
+fi
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$SWIFT_DIR/output/gsm8k_npu_compare}"
-RUN_DIR="$OUTPUT_ROOT/${BENCHMARK_FRAMEWORK}_${RUN_TAG}"
+RUN_DIR="$OUTPUT_ROOT/${BENCHMARK_FRAMEWORK}_${BENCHMARK_PROFILE}_${RUN_TAG}"
 
 export ASCEND_RT_VISIBLE_DEVICES="$NPU_DEVICES"
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
@@ -56,8 +128,8 @@ print(f'NPU devices: {devices}; training: 2; rollout: 2 (TP2); model: {model}; '
 PY
     mkdir -p "$RUN_DIR"
     {
-        printf 'framework=%s; training_npus=2; rollout_npus=2; max_staleness=%s\n' \
-            "$BENCHMARK_FRAMEWORK" "$MAX_STALENESS"
+        printf 'framework=%s; profile=%s; training_npus=2; rollout_npus=2; max_staleness=%s\n' \
+            "$BENCHMARK_FRAMEWORK" "$BENCHMARK_PROFILE" "$MAX_STALENESS"
         for repo in "$SWIFT_DIR" "$TWINKLE_DIR" "$VERL_DIR"; do
             if [[ -d "$repo/.git" || -f "$repo/.git" ]]; then
                 git -C "$repo" log -1 --format='%H %s'
