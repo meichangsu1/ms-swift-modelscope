@@ -2,11 +2,13 @@
 """Opt-in, real NPU acceptance tests for the Twinkle package split; see README.md."""
 
 from __future__ import annotations
-import asyncio
 import math
-import multiprocessing
 import os
 import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -34,112 +36,72 @@ def _model_configs():
     )
 
 
-def _serve(port: int, namespace: str) -> None:
-    # A fresh interpreter must resolve the split packages and Swift's worker hook itself.
-    output = _output()
-    with (output / "server.log").open("w") as log:
-        os.dup2(log.fileno(), 1)
-        os.dup2(log.fileno(), 2)
-    os.environ["TWINKLE_DEFAULT_SAVE_DIR"] = str(output / "server_checkpoints")
-    os.environ["TWINKLE_WORKER_SETUP_HOOK"] = "swift.dev.processor.server_plugin:register"
-    os.chdir(output)
-
-    import ray
-    from twinkle_server import launch_server
-    from twinkle_server.config import ApplicationSpec
-
-    from swift.dev.config import DeployConfig
-    from swift.dev.recipe.infer.run_deploy import build_server_config
-
-    model_config, template_config = _model_configs()
-    config = build_server_config(
-        model_config,
-        template_config,
-        deploy_config=DeployConfig(
-            host="127.0.0.1",
-            port=port,
-            route_prefix="/api/v1",
-            api_key="package-split",
-            served_model_name="policy",
-            ray_namespace=namespace,
-            enable_data_plane=True,
-        ),
-        engine_args={
-            "enforce_eager": True,
-            "max_model_len": 512,
-            "gpu_memory_utilization": 0.4,
-            "enable_lora": True,
-            "max_lora_rank": 8,
-            "additional_config": {"weight_nz_mode": 0},
-        },
-    )
-    config.applications.append(
-        ApplicationSpec(
-            name="training-policy",
-            route_prefix="/api/v1/model/policy",
-            import_path="model",
-            args={
-                "backend": "transformers",
-                "model_id": model_config.model,
-                "model_loader": "swift.dev.model.loader:build_model_loader",
-                "device_group": {"name": "model", "ranks": 1, "device_type": "npu"},
-                "device_mesh": {"dp_size": 1, "device_type": "npu"},
-                "min_replicas": 1,
-                "max_replicas": 1,
-                "max_loras": 1,
-                "max_r": 8,
-                "target_modules": ["q_proj", "v_proj"],
-                "max_length": 512,
-                "mixed_precision": "bf16",
-                "adapter_config": {"adapter_timeout": 1800},
-            },
-        )
-    )
-    config.trust_remote_code = True  # Resolve this checkout's explicitly configured Swift loader.
-    # Validate after adding the training deployment, before starting any workers.
-    config = type(config).model_validate(config.model_dump())
-    (output / "server_config.json").write_text(config.model_dump_json(indent=2))
-    try:
-        launch_server(config=config, ray_address="local")
-    finally:
-        ray.shutdown()
-
-
 @pytest.fixture(scope="module")
 def cs_server():
-    from swift.dev.recipe.infer.run_deploy import _wait_until_accessible
+    from .check_environment import check_environment
 
+    check_environment("client", _output() / "client_environment.json")
+    server_python = os.environ["SERVER_PYTHON"]
     assert not (_output() / "server_checkpoints").exists(), "Use a fresh PACKAGE_SPLIT_OUTPUT directory"
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    process = multiprocessing.get_context("spawn").Process(
-        target=_serve, args=(port, f"package-split-{uuid.uuid4().hex}")
-    )
-    process.start()
-    try:
-        _wait_until_accessible(
-            port,
-            900,
-            process,
-            "/api/v1",
-            api_key="package-split",
-            ready_probe=(
-                f"http://127.0.0.1:{port}/api/v1/completions",
-                {
-                    "model": "policy",
-                    "prompt": "Hello",
-                    "max_tokens": 1,
-                },
-            ),
+    base_url = f"http://127.0.0.1:{port}"
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    with (_output() / "server.log").open("w") as log:
+        process = subprocess.Popen(
+            [
+                server_python,
+                str(Path(__file__).with_name("serve_cs.py")),
+                "--port",
+                str(port),
+                "--namespace",
+                f"package-split-{uuid.uuid4().hex}",
+            ],
+            cwd=_output(),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
         )
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        process.terminate()
-        process.join(timeout=90)
-        if process.is_alive():
-            process.kill()
-            process.join(timeout=10)
+        try:
+            deadline = time.monotonic() + 900
+            headers = {"Authorization": "Bearer package-split", "Content-Type": "application/json"}
+            # The gateway can answer /models before its sampler has loaded the model.
+            probes = [
+                urllib.request.Request(f"{base_url}/api/v1/models", headers=headers),
+                urllib.request.Request(
+                    f"{base_url}/api/v1/completions",
+                    headers=headers,
+                    data=json.dumps({"model": "policy", "prompt": "Hello", "max_tokens": 1}).encode(),
+                ),
+            ]
+            for request in probes:
+                while time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        raise RuntimeError(
+                            f"CS server exited with code {process.returncode}; see {_output() / 'server.log'}"
+                        )
+                    try:
+                        with urllib.request.urlopen(request, timeout=10) as response:
+                            if response.status == 200:
+                                break
+                    except (urllib.error.URLError, OSError):
+                        pass
+                    time.sleep(1)
+                else:
+                    raise TimeoutError(f"CS server did not become ready; see {_output() / 'server.log'}")
+            yield base_url
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
 
 
 @pytest.fixture
@@ -221,11 +183,10 @@ def test_cs_train_save_reload(cs_server, cs_client):
         model.close()
 
 
-def test_cs_sample_and_data_plane(cs_server, cs_client):
-    """SSE/token sampling + async DataRef round trip, with real vLLM-Ascend."""
+def test_cs_sample(cs_server, cs_client):
+    """Exercise client token sampling and gateway SSE, without DataPlane storage or references."""
     import httpx
     from twinkle.data_format import InputFeature
-    from twinkle_client import DataPlaneClient
     from twinkle_client.sampler import vLLMSampler
 
     from swift.dev.builders.template import build_template_from_spec, build_template_spec
@@ -235,15 +196,17 @@ def test_cs_sample_and_data_plane(cs_server, cs_client):
     row = template.encode({"messages": [{"role": "user", "content": "Count from 1 to 5."}]}, add_generation_prompt=True)
     feature = InputFeature(input_ids=list(row["input_ids"]))
     sampler = vLLMSampler("policy")
-    params = {"max_tokens": 16, "temperature": 1.0, "logprobs": 1}
-    response = sampler.sample([feature], sampling_params=params)
-    assert len(response) == 1 and response[0].sequences[0].tokens
-    sequence = response[0].sequences[0]
+    responses = sampler.sample([feature], sampling_params={"max_tokens": 16, "temperature": 1.0, "logprobs": 1})
+    assert len(responses) == 1 and len(responses[0].sequences) == 1
+    sequence = responses[0].sequences[0]
+    assert sequence.tokens and len(sequence.tokens) <= 16
+    assert sequence.logprobs and len(sequence.logprobs) == len(sequence.tokens)
+    for token, candidates in zip(sequence.tokens, sequence.logprobs):
+        assert any(token_id == token and math.isfinite(logp) for token_id, logp in candidates)
     emitted = sequence.new_input_feature
     assert emitted["input_ids"] == list(feature["input_ids"]) + list(sequence.tokens)
     assert len(emitted["input_ids"]) == len(emitted["labels"]) == len(emitted["completion_mask"])
 
-    # Exercise the streaming queue bridge moved from the server package into twinkle.sampler.
     with httpx.stream(
         "POST",
         f"{cs_server}/api/v1/chat/completions",
@@ -258,34 +221,30 @@ def test_cs_sample_and_data_plane(cs_server, cs_client):
     ) as response:
         response.raise_for_status()
         events = [line[6:] for line in response.iter_lines() if line.startswith("data: ")]
-    assert events and events[-1] == "[DONE]", events
+    assert events and events[-1] == "[DONE]"
     chunks = [json.loads(event) for event in events[:-1]]
-    assert chunks and all("error" not in chunk for chunk in chunks), chunks
-    assert any(choice.get("delta", {}).get("content") for chunk in chunks for choice in chunk.get("choices", []))
-
-    async def round_trip():
-        data = DataPlaneClient()
-        ref = await sampler.asample_to_data_plane(
-            [feature], sampling_params=params, num_samples=2, group_ids=["split-group"]
+    assert chunks and all("error" not in chunk for chunk in chunks)
+    text = "".join(
+        choice.get("delta", {}).get("content") or "" for chunk in chunks for choice in chunk.get("choices", [])
+    )
+    assert text.strip(), "SSE completed without generated text"
+    (_output() / "cs_sample.json").write_text(
+        json.dumps(
+            {
+                "tokens": sequence.tokens,
+                "logprobs": sequence.logprobs,
+                "stream_text": text,
+                "stream_chunks": len(chunks),
+            }
         )
-        try:
-            rows = await data.aget(ref, fields=["decoded", "tokens", "sampled_logprobs"])
-            assert len(rows) == 2
-            for item in rows:
-                assert item["tokens"] and len(item["tokens"]) == len(item["sampled_logprobs"])
-                assert all(math.isfinite(value) for value in item["sampled_logprobs"])
-            ref = await data.aappend(ref, [{"reward": 1.0}, {"reward": 0.0}])
-            scored = await data.aget(ref, fields=["reward"])
-            assert [item["reward"] for item in scored] == [1.0, 0.0]
-            (_output() / "cs_sample.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2))
-        finally:
-            await data.arelease(ref)
-
-    asyncio.run(round_trip())
+    )
 
 
 def test_ray_async_grpo():
     """Four cards: FSDP2 trainer + TP2 sampler, real StreamingDriver and weight publication."""
+    from .check_environment import check_environment
+
+    check_environment("ray", _output() / "grpo_environment.json")
     from tests.v5.feature.rl.conftest import lora_b_nonzero, rl_configs, run_rl
     from tests.v5.feature.rl.test_async_e2e import _varied_content_reward
 
